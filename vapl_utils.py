@@ -67,20 +67,26 @@ class vapl_grid(torch.nn.Module):
         # It is possible to change learning rate during training
         #torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.95)
 
-    def forward(self, si):
-        X = ((si.p - self.bb_min) / (self.bb_max - self.bb_min)).torch()
-        gaussians : torch.Tensor = self.gaussian_grid(X.T)
+    def forward(self, input):
+        bb_min = torch.tensor(self.bb_min, device="cuda")
+        bb_max = torch.tensor(self.bb_max, device="cuda")
+
+        if isinstance(input, mi.SurfaceInteraction3f):
+            pos = torch.from_numpy(input.p.numpy()).to("cuda").permute(1, 0)
+        elif isinstance(input, torch.Tensor):
+            pos = input
+
+        X = (pos - bb_min) / (bb_max - bb_min)
+        gaussians : torch.Tensor = self.gaussian_grid(X)
         gaussians.requires_grad_()
-        vmf : torch.Tensor = self.vmf_grid(X.T)
+        vmf : torch.Tensor = self.vmf_grid(X)
         vmf.requires_grad_()
 
-        eps = 1e-2
+        eps = 1e-1
         
         mean = gaussians[:, :3]
-        bb_min = torch.tensor(self.bb_min, device=mean.device)
-        bb_max = torch.tensor(self.bb_max, device=mean.device)
-        
-        mean = torch.sigmoid(mean) * (bb_max - bb_min).unsqueeze(0) + bb_min.unsqueeze(0)
+        mean =  mean / eps * 0.5 + 0.5#(mean - mean.min()) / (mean.max() - mean.min())
+        mean = torch.relu(mean) * (bb_max - bb_min) + bb_min
         
         variance = gaussians[:, 3]
         variance = torch.clamp(torch.relu(variance), min=1e-3)
@@ -91,15 +97,15 @@ class vapl_grid(torch.nn.Module):
         axis = torch.nn.functional.normalize(vmf[:, 1:4], p=2, dim=1, eps=1e-6)
 
         amplitude = vmf[:, 4:7]
-        amplitude = torch.relu(vmf[:, 4:7])
+        amplitude = torch.sigmoid(vmf[:, 4:7])
 
         variance = variance.unsqueeze(1)
         sharpness = sharpness.unsqueeze(1)
     
         gaussians = torch.cat([mean, variance], dim = 1)
-        vmf = torch.cat([sharpness, axis, amplitude], dim = 1)
+        vmf = torch.cat([sharpness, axis,  amplitude], dim = 1)
 
-        return gaussians, vmf    
+        return gaussians, vmf   
 
 # Test function to see scene-ray intersection
 def get_camera_first_bounce(scene):
@@ -581,7 +587,8 @@ class vapl_mixture:
         ctx_specular.type_mask = mi.BSDFFlags.Glossy
         
         # Local outgoing direction
-        wo = si.to_local(-si.wi)
+        wo_world = (torch.nn.functional.normalize(light_vec, p=2, dim=1, eps=1e-6)).permute(1, 0)
+        wo = si.to_local(mi.Vector3f(wo_world))
 
         diffuse : mi.Color3f = bsdf.eval(ctx_diffuse, si, wo)
         specular = bsdf.eval(ctx_specular, si, wo)
@@ -1024,3 +1031,21 @@ def pix_coord(scene, batch, h, w):
         mi.Point2f: Pixel coordinates of the given 3D world coordinates.
     """
     return ndc_to_pixel(world_to_ndc(scene, batch), h, w)
+
+def get_all_gaussians(model):
+    resolution = 16
+    device = model.gaussian_grid.parameters().__next__().device
+
+    lin = torch.linspace(0, 1, resolution, device=device)
+    X, Y, Z = torch.meshgrid(lin, lin, lin, indexing='ij')
+ 
+    grid_points = torch.stack([X.flatten(), Y.flatten(), Z.flatten()], dim=-1)
+
+    bb_min = torch.tensor(model.bb_min, device=device)
+    bb_max = torch.tensor(model.bb_max, device=device)
+    world_positions : torch.Tensor = grid_points * (bb_max - bb_min) + bb_min
+
+    gaussians, vmfs = model(world_positions)
+
+    return gaussians, vmfs
+
