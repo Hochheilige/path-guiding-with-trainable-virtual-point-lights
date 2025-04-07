@@ -82,17 +82,20 @@ class vapl_grid(torch.nn.Module):
         vmf : torch.Tensor = self.vmf_grid(X)
         vmf.requires_grad_()
 
-        eps = 1e-1
+        eps = 1e-2
         
         mean = gaussians[:, :3]
-        mean =  mean / eps * 0.5 + 0.5#(mean - mean.min()) / (mean.max() - mean.min())
-        mean = torch.relu(mean) * (bb_max - bb_min) + bb_min
+        mean =  mean / eps * 0.5 + 0.5
+        #mean = (mean - mean.min()) / (mean.max() - mean.min()) 
+        mean = (mean) * (bb_max - bb_min) + bb_min
         
         variance = gaussians[:, 3]
         variance = torch.clamp(torch.relu(variance), min=1e-3)
 
         sharpness = vmf[:, 0]
-        sharpness = torch.exp(sharpness)
+        # Not sure that this is the reason but with exp gradients explode
+        #sharpness = torch.exp(sharpness) 
+        sharpness = torch.log1p(sharpness)
  
         axis = torch.nn.functional.normalize(vmf[:, 1:4], p=2, dim=1, eps=1e-6)
 
@@ -127,8 +130,8 @@ def get_camera_first_bounce(scene):
     return si, image_res
 
 def sg_product(axis1: torch.Tensor, sharpness1: torch.Tensor, axis2: torch.Tensor, sharpness2: torch.Tensor):
-    axis = axis1 * sharpness1 + axis2 * sharpness2 
-    sharpness = torch.norm(axis, dim=1, keepdim=True)
+    axis = axis1 * sharpness1 + axis2 * sharpness2
+    sharpness = torch.linalg.norm(axis, dim=1, keepdim=True) 
     
     d = axis1 - axis2
     len2 = torch.sum(d * d, dim=1, keepdim=True) 
@@ -142,6 +145,8 @@ def sg_product(axis1: torch.Tensor, sharpness1: torch.Tensor, axis2: torch.Tenso
 
 # [Tokuyoshi et al. 2024 "Hierarchical Light Sampling with Accurate Spherical Gaussian Lighting (Supplementary Document)" Listing. 5]
 def upper_sg_clamp_cosine_integral_over_two_pi(sharpness: torch.Tensor):
+    # FIXME: not sure that this clamp is good idea 
+    #sharpness_safe = torch.clamp(sharpness, min=1e-6, max=50)
     sharpness_safe = torch.clamp(sharpness, min=1e-6)
     small_sharpness = sharpness_safe <= 0.5
 
@@ -168,6 +173,8 @@ def upper_sg_clamp_cosine_integral_over_two_pi(sharpness: torch.Tensor):
 
 # [Tokuyoshi et al. 2024 "Hierarchical Light Sampling with Accurate Spherical Gaussian Lighting (Supplementary Document)" Listing. 6]
 def lower_sg_clamp_cosine_integral_over_two_pi(sharpness: torch.Tensor):
+    # FIXME: not sure that this clamp is good idea
+    #sharpness_safe = torch.clamp(sharpness, min=1e-6, max=50)
     sharpness_safe = torch.clamp(sharpness, min=1e-6)
     e = torch.exp(-sharpness_safe)
     small_sharpness = sharpness_safe <= 0.5
@@ -653,7 +660,7 @@ class vapl_mixture:
         light_lobe_axis_mi = tangent_frame.to_local(mi.cuda_ad_rgb.Vector3f(self.light_lobe_axis.permute(1, 0)))
         self.light_lobe_axis = torch.from_numpy(light_lobe_axis_mi.numpy()).to("cuda").T
         half_vec_unnormalize = wi_tensor + self.light_lobe_axis
-        half_vec = half_vec_unnormalize / torch.maximum(torch.norm(half_vec_unnormalize), torch.tensor(torch.finfo(torch.float32).eps))
+        half_vec = half_vec_unnormalize / torch.maximum(torch.linalg.norm(half_vec_unnormalize), torch.tensor(torch.finfo(torch.float32).eps))
         
         lobe = sgg_reflection_pdf(wi_tensor, half_vec, filtered_roughness_mat)
         
