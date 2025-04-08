@@ -95,8 +95,10 @@ class vapl_grid(torch.nn.Module):
         sharpness = vmf[:, 0]
         # Not sure that this is the reason but with exp gradients explode
         #sharpness = torch.exp(sharpness) 
-        sharpness = torch.log1p(sharpness)
- 
+        #sharpness = torch.log1p(sharpness)
+        # It helped fix crashes with NANs but doesn't look like a solution
+        sharpness = torch.clamp(sharpness, min=0.1, max=1.0)
+        
         axis = torch.nn.functional.normalize(vmf[:, 1:4], p=2, dim=1, eps=1e-6)
 
         amplitude = vmf[:, 4:7]
@@ -598,7 +600,7 @@ class vapl_mixture:
         wo = si.to_local(mi.Vector3f(wo_world))
 
         diffuse : mi.Color3f = bsdf.eval(ctx_diffuse, si, wo)
-        specular = bsdf.eval(ctx_specular, si, wo)
+        specular : mi.Color3f = bsdf.eval(ctx_specular, si, wo)
         
         # Diffuse SG lighting.
 		# [Tokuyoshi et al. 2024 "Hierarchical Light Sampling with Accurate Spherical Gaussian Lighting", Section 4]
