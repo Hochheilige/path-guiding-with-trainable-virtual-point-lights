@@ -8,13 +8,13 @@ def run(command):
 run(f"{sys.executable} -m pip install --upgrade pip")
 
 required_packages = [
-    "ipywigets",
-    "mitsuba",  
+    "ipywidgets",
+    "mitsuba",
     "drjit",
     "wandb",
     "matplotlib",
     "nbimporter",
-    "importn_ipynb",
+    "import_ipynb",
     "nbformat",
     "importlib-metadata; python_version<'3.8'",
     "wheel",
