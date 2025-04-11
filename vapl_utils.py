@@ -64,7 +64,7 @@ class vapl_grid(torch.nn.Module):
         # lr = 0.0001 - gives interesting results
         self.optimizer = torch.optim.Adam(
             list(self.gaussian_grid.parameters()) + list(self.vmf_grid.parameters()),
-            lr=0.0001
+            lr=0.001
         )
 
         # It is possible to change learning rate during training
@@ -86,32 +86,15 @@ class vapl_grid(torch.nn.Module):
         eps = 1e-2
 
         mean = gaussians[:, :3]
-        mean =  mean / eps * 0.5 + 0.5
-        #mean = (mean - mean.min()) / (mean.max() - mean.min())
-        mean = (mean) * (bb_max - bb_min) + bb_min
-
-        variance = gaussians[:, 3]
-        #variance = torch.clamp(torch.relu(variance), min=1e-3) # works stable
-        #variance = torch.relu(variance) # crash
-        #variance = torch.exp(variance) # gives something looks like specular, but crashes later
-        variance = torch.sigmoid(variance) # need to research this more
-
-        sharpness = vmf[:, 0]
-        #sharpness = torch.exp(sharpness) # Not sure that this is the reason but with exp gradients explode
-        #sharpness = torch.log1p(sharpness) # Negative sharpness - strange
-        sharpness = sharpness / eps * 0.5 + 0.5
-        sharpness = torch.relu(sharpness)
+        mean = (gaussians[:, :3] / eps * 0.5 + 0.5) * (bb_max - bb_min) + bb_min
+        variance = torch.exp(gaussians[:, 3]).unsqueeze(1)
+        sharpness = torch.exp(vmf[:, 0]).unsqueeze(1)
 
         axis = torch.nn.functional.normalize(vmf[:, 1:4], p=2, dim=1, eps=1e-6)
-
-        amplitude = vmf[:, 4:7]
         amplitude = torch.sigmoid(vmf[:, 4:7])
 
-        variance = variance.unsqueeze(1)
-        sharpness = sharpness.unsqueeze(1)
-
         gaussians = torch.cat([mean, variance], dim = 1)
-        vmf = torch.cat([sharpness, axis,  amplitude], dim = 1)
+        vmf = torch.cat([sharpness, axis, amplitude], dim = 1)
 
         return gaussians, vmf
 
@@ -141,7 +124,7 @@ def sg_product(axis1: torch.Tensor, sharpness1: torch.Tensor, axis2: torch.Tenso
     d = axis1 - axis2
     len2 = torch.sum(d * d, dim=1, keepdim=True)
 
-    denom = torch.maximum(sharpness + sharpness1 + sharpness2, torch.tensor(torch.finfo(torch.float32).min, device=sharpness.device))
+    denom = torch.maximum(sharpness + sharpness1 + sharpness2, torch.tensor(torch.finfo(torch.float32).eps, device=sharpness.device))
     log_amplitude = -sharpness1 * sharpness2 * len2 / denom
 
     axis = axis / torch.maximum(sharpness, torch.tensor(torch.finfo(torch.float32).eps, device=sharpness.device))
@@ -150,57 +133,30 @@ def sg_product(axis1: torch.Tensor, sharpness1: torch.Tensor, axis2: torch.Tenso
 
 # [Tokuyoshi et al. 2024 "Hierarchical Light Sampling with Accurate Spherical Gaussian Lighting (Supplementary Document)" Listing. 5]
 def upper_sg_clamp_cosine_integral_over_two_pi(sharpness: torch.Tensor):
-    # FIXME: not sure that this clamp is good idea
-    #sharpness_safe = torch.clamp(sharpness, min=1e-6, max=50)
-    sharpness_safe = torch.clamp(sharpness, min=1e-6)
-    small_sharpness = sharpness_safe <= 0.5
+    mask = sharpness <= 0.5
+    result = torch.zeros_like(sharpness)
 
+    if mask.any():
+        result[mask] = (((((((-1.0 / 362880.0) * sharpness[mask] + 1.0 / 40320.0) * sharpness[mask] - 1.0 / 5040.0) * sharpness[mask] + 1.0 / 720.0) * sharpness[mask] - 1.0 / 120.0) * sharpness[mask] + 1.0 / 24.0) * sharpness[mask] - 1.0 / 6.0) * sharpness[mask] + 0.5;
 
-    # Taylor-series approximation for numerical stability.
-    taylor_series = (
-        (-1.0 / 362880.0) * sharpness_safe +
-        (1.0 / 40320.0)
-    )
-    taylor_series = taylor_series * sharpness_safe - (1.0 / 5040.0)
-    taylor_series = taylor_series * sharpness_safe + (1.0 / 720.0)
-    taylor_series = taylor_series * sharpness_safe - (1.0 / 120.0)
-    taylor_series = taylor_series * sharpness_safe + (1.0 / 24.0)
-    taylor_series = taylor_series * sharpness_safe - (1.0 / 6.0)
-    taylor_series = taylor_series * sharpness_safe + 0.5
+    if (~mask).any():
+        result[~mask] = (torch.expm1(-sharpness[~mask]) + sharpness[~mask]) / (sharpness[~mask] * sharpness[~mask])
 
-    integral = torch.empty_like(sharpness_safe)
-    integral[small_sharpness] = taylor_series[small_sharpness]
-    integral[~small_sharpness] = (torch.expm1(-sharpness_safe[~small_sharpness]) + sharpness_safe[~small_sharpness]) / (sharpness_safe[~small_sharpness] ** 2)
-
-    float_max = torch.finfo(sharpness_safe.dtype).max
-    return torch.nan_to_num(integral, nan=0.0, posinf=float_max, neginf=-float_max)
-
+    return result
 
 # [Tokuyoshi et al. 2024 "Hierarchical Light Sampling with Accurate Spherical Gaussian Lighting (Supplementary Document)" Listing. 6]
 def lower_sg_clamp_cosine_integral_over_two_pi(sharpness: torch.Tensor):
-    # FIXME: not sure that this clamp is good idea
-    #sharpness_safe = torch.clamp(sharpness, min=1e-6, max=50)
-    sharpness_safe = torch.clamp(sharpness, min=1e-6)
-    e = torch.exp(-sharpness_safe)
-    small_sharpness = sharpness_safe <= 0.5
+    e = torch.exp(-sharpness)
+    mask = sharpness <= 0.5
+    result = torch.zeros_like(sharpness)
 
-    # Taylor-series approximation for numerical stability.
-    taylor_series = (1.0 / 403200.0) * sharpness_safe - (1.0 / 45360.0)
-    taylor_series = taylor_series * sharpness_safe + (1.0 / 5760.0)
-    taylor_series = taylor_series * sharpness_safe - (1.0 / 840.0)
-    taylor_series = taylor_series * sharpness_safe + (1.0 / 144.0)
-    taylor_series = taylor_series * sharpness_safe - (1.0 / 30.0)
-    taylor_series = taylor_series * sharpness_safe + (1.0 / 8.0)
-    taylor_series = taylor_series * sharpness_safe - (1.0 / 3.0)
-    taylor_series = taylor_series * sharpness_safe + 0.5
-    taylor_series = e * taylor_series
+    if mask.any():
+        result[mask] = e[mask] * (((((((((1.0 / 403200.0) * sharpness[mask] - 1.0 / 45360.0) * sharpness[mask] + 1.0 / 5760.0) * sharpness[mask] - 1.0 / 840.0) * sharpness[mask] + 1.0 / 144.0) * sharpness[mask] - 1.0 / 30.0) * sharpness[mask] + 1.0 / 8.0) * sharpness[mask] - 1.0 / 3.0) * sharpness[mask] + 0.5)
 
-    integral = torch.empty_like(sharpness_safe)
-    integral[small_sharpness] = taylor_series[small_sharpness]
-    integral[~small_sharpness] = e[~small_sharpness] * (-torch.expm1(-sharpness_safe[~small_sharpness]) - sharpness_safe[~small_sharpness] * e[~small_sharpness]) / (sharpness_safe[~small_sharpness] ** 2)
+    if (~mask).any():
+        result[~mask] = e[~mask] * (-torch.expm1(-sharpness[~mask]) - sharpness[~mask] * e[~mask]) / (sharpness[~mask] * sharpness[~mask])
 
-    float_max = torch.finfo(sharpness_safe.dtype).max
-    return torch.nan_to_num(integral, nan=0.0, posinf=float_max, neginf=-float_max)
+    return result
 
 
 # Approximate product integral of an SG and clamped cosine / pi.
@@ -559,7 +515,7 @@ class vapl_mixture:
         sampled_dir : torch.Tensor = sample_vmf(axis, sharpness[:, :1])
         return sampled_dir.permute(1, 0)
 
-    def convolve_with_bsdf(self, si : mi.SurfaceInteraction3f):
+    def convolve_with_bsdf(self, si : mi.SurfaceInteraction3f, ray_dir):
         SGLIGHT_SHARPNESS_MAX = float.fromhex("0x1.0p41")
 
         position  = si.p
@@ -576,7 +532,7 @@ class vapl_mixture:
         light_dir = light_vec * torch.rsqrt(squared_distance)
 
         # clamp variance for the numerical stability
-        variance = torch.max(self.variance.unsqueeze(1), squared_distance / SGLIGHT_SHARPNESS_MAX)
+        variance = torch.maximum(self.variance.unsqueeze(1), squared_distance / SGLIGHT_SHARPNESS_MAX)
 
         # compute the maximum emissive radiance of the vapl.
         emissive = self.amplitude / (variance)
@@ -599,7 +555,7 @@ class vapl_mixture:
         ctx_specular.type_mask = mi.BSDFFlags.Glossy
 
         # Local outgoing direction
-        wo_world = (torch.nn.functional.normalize(light_vec, p=2, dim=1, eps=1e-6)).permute(1, 0)
+        wo_world = (torch.nn.functional.normalize(-ray_dir.torch().permute(1, 0), p=2, dim=1, eps=1e-6)).permute(1, 0)
         wo = si.to_local(mi.Vector3f(wo_world))
 
         diffuse : mi.Color3f = bsdf.eval(ctx_diffuse, si, wo)
@@ -616,6 +572,9 @@ class vapl_mixture:
         specular_tensor : torch.Tensor = specular.torch().permute(1, 0)
 
         diffuse_illumination_result = diffuse_tensor * diffuse_illumination
+        result = emissive * diffuse_illumination_result
+        self.illumination  = result
+        return luminance(result)
 
         # Compute JJ^T for NDF filtering.
         wi = si.wi
@@ -792,29 +751,26 @@ def render_rhs(scene : mi.Scene, si : mi.SurfaceInteraction3f, sampler, β):
         return L, β
 
 
-def render_rhs_original(scene, si, sampler):
+def render_rhs_original(scene, si, sampler, β):
     with dr.suspend_grad():
         bsdf_ctx = mi.BSDFContext()
-        depth = mi.UInt32(0)
         L = mi.Spectrum(0)
-        β = mi.Spectrum(1)
-        η = mi.Float(1)
-        prev_si = dr.zeros(mi.SurfaceInteraction3f)
-        prev_bsdf_pdf = mi.Float(1.0)
-        prev_bsdf_delta = mi.Bool(True)
         bsdf = si.bsdf()
         Le = β * si.emitter(scene).eval(si)
+
         # emitter sampling
         active_next = si.is_valid()
         active_em = active_next & mi.has_flag(bsdf.flags(), mi.BSDFFlags.Smooth)
         ds, em_weight = scene.sample_emitter_direction(
             si, sampler.next_2d(), True, active_em
         )
+
         active_em &= (ds.pdf != 0.0)
         wo = si.to_local(ds.d)
         bsdf_value_em, bsdf_pdf_em = bsdf.eval_pdf(bsdf_ctx, si, wo, active_em)
         mis_em = dr.select(ds.delta, 1, mis_weight(ds.pdf, bsdf_pdf_em))
         Lr_dir = β * mis_em * bsdf_value_em * em_weight
+
         # bsdf sampling
         bsdf_sample, bsdf_weight = bsdf.sample(
             bsdf_ctx, si, sampler.next_1d(), sampler.next_2d(), active_next
@@ -822,7 +778,7 @@ def render_rhs_original(scene, si, sampler):
         # update
         L = L + Le + Lr_dir
 
-    return L
+    return L, bsdf_sample, β*bsdf_weight
 
 class Loss():
     def __init__(self, loss_fn):
@@ -931,15 +887,17 @@ class RHSIntegrator(ADIntegrator):
             ray, ray_flags=mi.RayFlags.All, coherent=(depth==0)
         )
 
+        gaussians, vmfs = self.model(si)
+        mixture = vapl_mixture(gaussians, vmfs)
+        mixture.convolve_with_bsdf(si, ray.d)
+
         # update si and bsdf with the first non-specular ones
         si, β, _ = first_non_specular_or_null_si(scene, si, sampler, β)
 
-        gaussians, vmfs = self.model(si)
-        mixture = vapl_mixture(gaussians, vmfs)
-        self.vapl_pos = mixture.mean
-        weight = mixture.convolve_with_bsdf(si)
+        # TODO: make this better but not critical
+        bss = []
 
-        for depth in range(5):
+        for depth in range(4):
             if (depth > 0):
                 si = scene.ray_intersect(
                     ray, ray_flags=mi.RayFlags.All, coherent=(depth==0)
@@ -949,14 +907,14 @@ class RHSIntegrator(ADIntegrator):
                 si, β, _ = first_non_specular_or_null_si(scene, si, sampler, β)
 
 
-            L = render_rhs_original(scene, si, sampler)
-            bs, _ = si.bsdf(ray).sample(bsdf_ctx, si, sampler.next_1d(), sampler.next_2d())
+            L, bs, β = render_rhs_original(scene, si, sampler, β)
             ray = si.spawn_ray(si.to_world(bs.wo))
 
-            res_l = res_l + L
+            res_l = res_l + (L)
+            bss.append(bs)
 
         vapl_l = mixture.illumination
-        return res_l * β, vapl_l, weight.unsqueeze(-1), si
+        return res_l, vapl_l, bss[0].pdf.torch().unsqueeze(-1), si
 
 
     def sample(self,
@@ -976,9 +934,9 @@ class RHSIntegrator(ADIntegrator):
 
         loss : torch.Tensor = self.loss_function(L_vapl, L_tensor, weight)
         self.losses.append(loss.detach().cpu())
+        self.model.optimizer.zero_grad()
         loss.backward()
         self.model.optimizer.step()
-        self.model.optimizer.zero_grad()
 
         torch.cuda.empty_cache()
         return L_vapl.permute(1, 0), si.is_valid(), [], mi.Spectrum(0)
@@ -1044,8 +1002,6 @@ def pix_coord(scene, batch, h, w):
     """
     return ndc_to_pixel(world_to_ndc(scene, batch), h, w)
 
-import torchvision
-from torchview import draw_graph
 def get_all_gaussians(model):
     resolution = 16
     device = model.gaussian_grid.parameters().__next__().device
@@ -1063,3 +1019,18 @@ def get_all_gaussians(model):
 
     return gaussians, vmfs
 
+def print_tensor_stats(tensor, tensor_name="tensor"):
+    # TODO: add asserts for wrong tensors
+    with torch.no_grad():
+        if isinstance(tensor, torch.Tensor):
+            if tensor.ndim == 2 and (tensor.shape[1] == 1 or tensor.shape[1] == 3):
+                min_val = tensor.min(axis=0).values
+                max_val = tensor.max(axis=0).values
+
+                print(f"Tensor name: {tensor_name}")
+                print(f"Min value: {min_val}")
+                print(f"Max value: {max_val}")
+            else:
+                print("Tensor must have shape (N, 1) or (N, 3).")
+        else:
+            print("Input is not a valid torch tensor.")
