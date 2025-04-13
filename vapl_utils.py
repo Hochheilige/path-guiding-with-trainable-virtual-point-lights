@@ -85,7 +85,7 @@ class vapl_grid(torch.nn.Module):
 
         eps = 1e-2
 
-        mean = gaussians[:, :3]
+        #mean = gaussians[:, :3]
         mean = (gaussians[:, :3] / eps * 0.5 + 0.5) * (bb_max - bb_min) + bb_min
         variance = torch.exp(gaussians[:, 3]).unsqueeze(1)
         sharpness = torch.exp(vmf[:, 0]).unsqueeze(1)
@@ -203,10 +203,17 @@ def sggx(m: torch.Tensor, roughness_mat: torch.Tensor) -> torch.Tensor:
         torch.stack([-roughness_mat[..., 1, 0], roughness_mat[..., 0, 0]], dim=-1)
     ], dim=-2)
 
+    # FIXME: not sure that it should be normalized here
+    m = m / torch.linalg.norm(m, dim=-1, keepdim=True)
+
+    # Compute length2
     m_xy = m[..., :2].unsqueeze(-2)
-    length2 = (m_xy @ roughness_mat_adj @ m_xy.transpose(-2, -1)).squeeze(-1).squeeze(-1) / det + m[..., 2] ** 2
+    term1 = (m_xy @ roughness_mat_adj @ m_xy.transpose(-2, -1)).squeeze(-1).squeeze(-1) / det
+    term2 = m[..., 2] ** 2
+    length2 = term1 + term2
 
     length2 = length2.clamp(min=1e-4)
+
     sqrt_det = torch.sqrt(det).clamp(min=1e-4)
 
     denom = sqrt_det * length2 ** 2
@@ -269,16 +276,21 @@ def isotropic_ndf_filtering(si: mi.SurfaceInteraction3f):
     SIGMA2 = 0.15915494  # Variance of pixel filter kernel (1/(2pi))
     KAPPA = 0.18
 
-    dndu = torch.from_numpy(si.dn_du.numpy()).to("cuda").T
-    dndv = torch.from_numpy(si.dn_dv.numpy()).to("cuda").T
+    dndu = si.dn_du.torch().permute(1, 0)
+    dndv = si.dn_dv.torch().permute(1, 0)
     mask = si.is_valid()
-    roughness = torch.tensor(si.bsdf().eval_attribute_1("roughness", si, mask), dtype=torch.float32).unsqueeze(-1)
 
-    # Eq. 14
-    kernel_roughness2 = SIGMA2 * (torch.sum(dndu * dndu, dim=-1) + torch.sum(dndv * dndv, dim=-1))
-    kernel_roughness2 = kernel_roughness2.unsqueeze(-1)
-    clamped_kernel_roughness2 = torch.clamp(kernel_roughness2, max=KAPPA)
-    filtered_roughness2 = torch.clamp(roughness**2 + clamped_kernel_roughness2, min=0.0, max=1.0)
+    # alpha_u and alpha_v are anisotropic roughness parameters
+    alpha_u = torch.tensor(si.bsdf().eval_attribute_1("alpha_u", si, mask), dtype=torch.float32, device="cuda")
+    alpha_v = torch.tensor(si.bsdf().eval_attribute_1("alpha_v", si, mask), dtype=torch.float32, device="cuda")
+
+    # [N, 1] kernel roughness from Eq.14
+    kernel_roughness2 = SIGMA2 * (torch.sum(dndu * dndu, dim=-1) + torch.sum(dndv * dndv, dim=-1))  # [N]
+    clamped_kernel_roughness2 = torch.clamp(kernel_roughness2, max=KAPPA).unsqueeze(-1)  # [N, 1]
+
+    # Roughness as [N, 2] (u and v)
+    roughness = torch.stack([alpha_u, alpha_v], dim=-1)  # [N, 2]
+    filtered_roughness2 = torch.clamp(roughness ** 2 + clamped_kernel_roughness2, min=0.0, max=1.0)  # [N, 2]
 
     return torch.sqrt(filtered_roughness2)
 
@@ -520,12 +532,10 @@ class vapl_mixture:
 
         position  = si.p
         normal    = si.n
-        tangent   = si.dp_du
-        bitangent = si.dp_dv
 
         pos_tensor  = torch.from_numpy(position.numpy()).to("cuda").permute(1, 0)
         norm_tensor = torch.from_numpy(normal.numpy()).to("cuda").permute(1, 0)
-        tangent_frame = mi.Frame3f(tangent, bitangent, normal)
+        tangent_frame = mi.Frame3f(normal)
 
         light_vec = self.mean - pos_tensor
         squared_distance = torch.sum(light_vec * light_vec, dim=1).unsqueeze(1)
@@ -572,26 +582,30 @@ class vapl_mixture:
         specular_tensor : torch.Tensor = specular.torch().permute(1, 0)
 
         diffuse_illumination_result = diffuse_tensor * diffuse_illumination
-        result = emissive * diffuse_illumination_result
-        self.illumination  = result
-        return luminance(result)
 
         # Compute JJ^T for NDF filtering.
-        wi = si.wi
-        wi_tensor = torch.from_numpy(wi.numpy()).to("cuda").T
+
+        # FIXME:
+        # If use here si.to_local/tangent_frame.to_local it leads to nan/inf values for jacobian
+        wi = ray_dir
+        wi_tensor = wi.torch().permute(1, 0)
         jj_mat = compute_jacobian(wi_tensor)
+        print("jjmat", jj_mat.min(), jj_mat.max())
 
         # Compute determinant of JJ^T
-        eps = torch.finfo(torch.float32).eps
+        eps = 1e-2
 
-        wi_z = torch.from_numpy(wi.z.numpy()).to("cuda")
+        wi_z = wi.z.torch()
         det_jj4 = 1.0 / (4.0 * wi_z * wi_z)
         roughness = isotropic_ndf_filtering(si)
         roughness2 = roughness**2
         proj_roughness2 = roughness2 / torch.maximum(1.0 - roughness2, torch.tensor(eps, device=roughness2.device))
-        reflect_sharpness = (1.0 - roughness2) / torch.maximum(2.0 * roughness2, torch.tensor(eps, device=roughness2.device))
-        reflect_vec_tensor = torch.from_numpy(mi.reflect(si.wi, normal).numpy()).to("cuda").T
+        roughness_max2 = torch.max(roughness, dim=-1, keepdim=True).values
+        # FIXME: not sure but maybe sharpness too big
+        reflect_sharpness = (1.0 - roughness_max2) / torch.maximum(2.0 * roughness_max2, torch.tensor(eps, device=roughness2.device))
+        reflect_vec_tensor = mi.reflect(-ray_dir, normal).torch().permute(1, 0)
         reflect_vec = reflect_vec_tensor * reflect_sharpness
+        print_tensor_stats(reflect_vec, "reflect_vec")
 
         # Glossy SG lighting.
 		# [Tokuyoshi et al. 2024 "Hierarchical Light Sampling with Accurate Spherical Gaussian Lighting", Section 5]
@@ -628,7 +642,10 @@ class vapl_mixture:
 
         lobe = sgg_reflection_pdf(wi_tensor, half_vec, filtered_roughness_mat)
 
-        specular_illumination = amplitude * visibility * lobe * sg_integral(self.light_lobe_sharpness)
+        # TODO: there could be a problem
+        sg_int = sg_integral(self.light_lobe_sharpness)
+
+        specular_illumination = amplitude * visibility * lobe * sg_int
         specular_illumination_result = specular_tensor * specular_illumination
 
         result = emissive * (diffuse_illumination_result + specular_illumination_result)
@@ -1023,7 +1040,7 @@ def print_tensor_stats(tensor, tensor_name="tensor"):
     # TODO: add asserts for wrong tensors
     with torch.no_grad():
         if isinstance(tensor, torch.Tensor):
-            if tensor.ndim == 2 and (tensor.shape[1] == 1 or tensor.shape[1] == 3):
+            if tensor.ndim == 2 and (tensor.shape[1] == 1 or tensor.shape[1] == 2 or tensor.shape[1] == 3):
                 min_val = tensor.min(axis=0).values
                 max_val = tensor.max(axis=0).values
 
