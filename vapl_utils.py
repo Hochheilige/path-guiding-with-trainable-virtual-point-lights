@@ -203,9 +203,6 @@ def sggx(m: torch.Tensor, roughness_mat: torch.Tensor) -> torch.Tensor:
         torch.stack([-roughness_mat[..., 1, 0], roughness_mat[..., 0, 0]], dim=-1)
     ], dim=-2)
 
-    # FIXME: not sure that it should be normalized here
-    m = m / torch.linalg.norm(m, dim=-1, keepdim=True)
-
     # Compute length2
     m_xy = m[..., :2].unsqueeze(-2)
     term1 = (m_xy @ roughness_mat_adj @ m_xy.transpose(-2, -1)).squeeze(-1).squeeze(-1) / det
@@ -263,9 +260,19 @@ def compute_jacobian(wi_tensor: torch.Tensor):
         torch.stack([v[:, 1],  v[:, 0]], dim=-1)
     ], dim=1)
 
+    eps = 1e-3
+    wi_z = torch.where(
+        wi_tensor[:, 2].abs() > eps,
+        wi_tensor[:, 2],
+        torch.where(wi_tensor[:, 2] == 0,
+                torch.full_like(wi_tensor[:, 2], eps),
+                torch.sign(wi_tensor[:, 2]) * eps)
+    )
+    d = 0.5 / wi_z
+
     scale_mat = torch.stack([
-        torch.full((wi_tensor.shape[0], 2), 0.5, device=wi_tensor.device, dtype=wi_tensor.dtype),
-        torch.stack([torch.zeros_like(wi_tensor[:, 2]), 0.5 / wi_tensor[:, 2]], dim=-1)
+        torch.stack([torch.full_like(wi_z, 0.5), torch.zeros_like(wi_z)], dim=-1),
+        torch.stack([torch.zeros_like(wi_z), d], dim=-1)
     ], dim=1)
     jacobian_mat = torch.matmul(rot_mat, scale_mat)
     jj_mat = torch.matmul(jacobian_mat, jacobian_mat.transpose(1, 2))
@@ -587,15 +594,27 @@ class vapl_mixture:
 
         # FIXME:
         # If use here si.to_local/tangent_frame.to_local it leads to nan/inf values for jacobian
-        wi = ray_dir
+        # but in original work they use const float3 wi = mul(tangentFrame, viewDir);
+        #this could be correct but gives wi.z == 0 that break jacobian
+        wi = si.sh_frame.to_local(ray_dir)
+        # leave without tangent space for now
+        #wi = ray_dir
         wi_tensor = wi.torch().permute(1, 0)
+        print_tensor_stats(wi_tensor, "wi")
         jj_mat = compute_jacobian(wi_tensor)
-        print("jjmat", jj_mat.min(), jj_mat.max())
+        #print("jjmat", jj_mat.min(), jj_mat.max())
 
         # Compute determinant of JJ^T
-        eps = 1e-2
+        eps = 1e-4
 
         wi_z = wi.z.torch()
+        wi_z = torch.where(
+            wi_z.abs() > eps,
+            wi_z,
+            torch.where(wi_z == 0,
+                torch.full_like(wi_z, eps),
+                torch.sign(wi_z) * eps)
+        )
         det_jj4 = 1.0 / (4.0 * wi_z * wi_z)
         roughness = isotropic_ndf_filtering(si)
         roughness2 = roughness**2
@@ -633,21 +652,30 @@ class vapl_mixture:
 
         # visibility of the SG light in the upper hemisphere.
         visibility = vmf_hemispherical_integral(torch.sum(prod_dir * norm_tensor, dim=1), prod_sharpness)
+        print_tensor_stats(visibility)
 
         # evaluate the filtered reflection lobe
-        light_lobe_axis_mi = tangent_frame.to_local(mi.cuda_ad_rgb.Vector3f(self.light_lobe_axis.permute(1, 0)))
-        self.light_lobe_axis = torch.from_numpy(light_lobe_axis_mi.numpy()).to("cuda").T
-        half_vec_unnormalize = wi_tensor + self.light_lobe_axis
-        half_vec = half_vec_unnormalize / torch.maximum(torch.linalg.norm(half_vec_unnormalize), torch.tensor(torch.finfo(torch.float32).eps))
+        # FIXME: right now I make calulations in workd space not in tangent
+        light_lobe_axis_tf = si.sh_frame.to_local(mi.Vector3f(self.light_lobe_axis.permute(1, 0)))
+        half_vec_unnormalize = wi_tensor + light_lobe_axis_tf.torch().permute(1, 0)
+        #half_vec_unnormalize = wi_tensor + self.light_lobe_axis
+        print_tensor_stats(half_vec_unnormalize, "half vec unnorm")
+        half_vec = torch.nn.functional.normalize(half_vec_unnormalize, p=2, dim=1, eps=1e-6)
+        print_tensor_stats(half_vec, "half vec")
 
         lobe = sgg_reflection_pdf(wi_tensor, half_vec, filtered_roughness_mat)
+        print_tensor_stats(lobe, "lobe")
 
         # TODO: there could be a problem
         sg_int = sg_integral(self.light_lobe_sharpness)
+        print_tensor_stats(sg_int, "sg_int")
 
         specular_illumination = amplitude * visibility * lobe * sg_int
-        specular_illumination_result = specular_tensor * specular_illumination
-
+        print_tensor_stats(specular_illumination, "specular illumination")
+        print_tensor_stats(specular_tensor, "specular bsdf")
+        specular_illumination_result = specular_tensor * specular_illumination * 1000
+        print_tensor_stats(specular_illumination_result, "specuar result")
+        print_tensor_stats(diffuse_illumination_result, "diffuse res")
         result = emissive * (diffuse_illumination_result + specular_illumination_result)
 
         # Store illumination to calculate Loss later
@@ -1037,6 +1065,7 @@ def get_all_gaussians(model):
     return gaussians, vmfs
 
 def print_tensor_stats(tensor, tensor_name="tensor"):
+    return
     # TODO: add asserts for wrong tensors
     with torch.no_grad():
         if isinstance(tensor, torch.Tensor):
