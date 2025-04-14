@@ -247,35 +247,28 @@ def luminance(color: torch.Tensor):
     return torch.sum(color * weights, dim=1)
 
 def compute_jacobian(wi_tensor: torch.Tensor):
-    vlen = torch.linalg.norm(wi_tensor[:, :2], dim=1, keepdim=True)
+    vlen = torch.norm(wi_tensor[:, :2], dim=1)
 
     v = torch.where(
-        vlen == 0,
-        torch.tensor([[1.0, 0.0]], device=wi_tensor.device, dtype=wi_tensor.dtype).expand(wi_tensor.shape[0], -1),
-        wi_tensor[:, :2] / vlen
+        vlen.unsqueeze(-1) != 0.0,
+        wi_tensor[:, :2] / vlen.unsqueeze(-1),
+        torch.tensor([1.0, 0.0], dtype=torch.float32, device=wi_tensor.device),
     )
 
-    rot_mat = torch.stack([
-        torch.stack([v[:, 0], -v[:, 1]], dim=-1),
-        torch.stack([v[:, 1],  v[:, 0]], dim=-1)
-    ], dim=1)
+    jacobian_mat_1 = torch.zeros((wi_tensor.shape[0], 2, 2), dtype=torch.float32, device=wi_tensor.device)
+    jacobian_mat_1[:, 0, 0] = v[:, 0]
+    jacobian_mat_1[:, 0, 1] = -v[:, 1]
+    jacobian_mat_1[:, 1, 0] = v[:, 1]
+    jacobian_mat_1[:, 1, 1] = v[:, 0]
 
-    eps = 1e-3
-    wi_z = torch.where(
-        wi_tensor[:, 2].abs() > eps,
-        wi_tensor[:, 2],
-        torch.where(wi_tensor[:, 2] == 0,
-                torch.full_like(wi_tensor[:, 2], eps),
-                torch.sign(wi_tensor[:, 2]) * eps)
-    )
-    d = 0.5 / wi_z
+    jacobian_mat_2 = torch.zeros((wi_tensor.shape[0], 2, 2), dtype=torch.float32, device=wi_tensor.device)
+    jacobian_mat_2[:, 0, 0] = 0.5
+    jacobian_mat_2[:, 0, 1] = 0.0
+    jacobian_mat_2[:, 1, 0] = 0.0
+    jacobian_mat_2[:, 1, 1] = 0.5 / wi_tensor[:, 2]
 
-    scale_mat = torch.stack([
-        torch.stack([torch.full_like(wi_z, 0.5), torch.zeros_like(wi_z)], dim=-1),
-        torch.stack([torch.zeros_like(wi_z), d], dim=-1)
-    ], dim=1)
-    jacobian_mat = torch.matmul(rot_mat, scale_mat)
-    jj_mat = torch.matmul(jacobian_mat, jacobian_mat.transpose(1, 2))
+    jacobian_mat = torch.bmm(jacobian_mat_1, jacobian_mat_2)
+    jj_mat = torch.bmm(jacobian_mat, jacobian_mat.transpose(1, 2))
 
     return jj_mat
 
@@ -543,6 +536,7 @@ class vapl_mixture:
 
     def convolve_with_bsdf(self, si : mi.SurfaceInteraction3f, view_dir : mi.Vector3f):
         SGLIGHT_SHARPNESS_MAX = float.fromhex("0x1.0p41")
+        eps = 1e-4
 
         position  = si.p
         normal    = si.n
@@ -596,28 +590,21 @@ class vapl_mixture:
         # but in original work they use const float3 wi = mul(tangentFrame, viewDir);
         #this could be correct but gives wi.z == 0 that break jacobian
         wi = si.sh_frame.to_local(view_dir)
-        # leave without tangent space for now
-        #wi = ray_dir
         wi_tensor = wi.torch().permute(1, 0)
+        mask = wi_tensor[:, 2] == 0
+        wi_tensor[mask] += eps
+
         jj_mat = compute_jacobian(wi_tensor)
+        #print("jacobian", jj_mat.min(), jj_mat.max())
 
         # Compute determinant of JJ^T
-        eps = 1e-4
+        det_jj4 = 1.0 / (4.0 * wi_tensor[:, 2] ** 2)
 
-        wi_z = wi.z.torch()
-        wi_z = torch.where(
-            wi_z.abs() > eps,
-            wi_z,
-            torch.where(wi_z == 0,
-                torch.full_like(wi_z, eps),
-                torch.sign(wi_z) * eps)
-        )
-        det_jj4 = 1.0 / (4.0 * wi_z * wi_z)
         roughness = isotropic_ndf_filtering(si)
         roughness2 = roughness**2
         proj_roughness2 = roughness2 / torch.maximum(1.0 - roughness2, torch.tensor(eps, device=roughness2.device))
         roughness_max2 = torch.max(roughness, dim=-1, keepdim=True).values
-        # FIXME: not sure but maybe sharpness too big
+
         reflect_sharpness = (1.0 - roughness_max2) / torch.maximum(2.0 * roughness_max2, torch.tensor(eps, device=roughness2.device))
         reflect_vec_tensor = mi.reflect(-view_dir, normal).torch().permute(1, 0)
         reflect_vec = reflect_vec_tensor * reflect_sharpness
@@ -628,66 +615,99 @@ class vapl_mixture:
         prod_sharpness = torch.linalg.norm(prod_vec, dim=1, keepdim=True)
         prod_dir = prod_vec / prod_sharpness
 
-        light_lobe_variance = 1.0 / self.light_lobe_sharpness
-        filtered_proj_roughness_mat = torch.diag(proj_roughness2) + 2.0 * light_lobe_variance.unsqueeze(-1) * jj_mat
+        light_lobe_variance = (1.0 / self.light_lobe_sharpness).squeeze(-1)
 
-        proj_roughness2 = (roughness2 / torch.maximum(1.0 - roughness2, torch.tensor(eps, device=roughness2.device)))
+        filtered_proj_roughness_mat = torch.zeros((proj_roughness2.shape[0], 2, 2), dtype=torch.float32, device=proj_roughness2.device)
+        filtered_proj_roughness_mat[:, 0, 0] = proj_roughness2[:, 0]
+        filtered_proj_roughness_mat[:, 1, 1] = proj_roughness2[:, 1]
+
+        doubled_light_lobe_var = 2.0 * light_lobe_variance
+        var_jj_mat = jj_mat
+        var_jj_mat[:, 0, 0] *= doubled_light_lobe_var
+        var_jj_mat[:, 0, 1] *= doubled_light_lobe_var
+        var_jj_mat[:, 1, 0] *= doubled_light_lobe_var
+        var_jj_mat[:, 1, 1] *= doubled_light_lobe_var
+
+        filtered_proj_roughness_mat = filtered_proj_roughness_mat + var_jj_mat
+        #print("filtered proj roughness", filtered_proj_roughness_mat.min(), filtered_proj_roughness_mat.max())
 
         # Compute the determinant of filteredProjRoughnessMat in a numerically stable manner.
 		# See the supplementary document (Section 5.2) of the paper for the derivation.
-        det = (proj_roughness2[:, 0] * proj_roughness2[:, 1] + 2.0 * light_lobe_variance.squeeze(-1)
-               * (proj_roughness2[:, 0] * jj_mat[:, 0, 0] + proj_roughness2[:, 1] * jj_mat[:, 1, 1])
-               + light_lobe_variance.squeeze(-1) ** 2 * det_jj4.squeeze(-1))
+        jj_mat_11 = jj_mat[:, 0, 0]
+        jj_mat_22 = jj_mat[:, 1, 1]
+        det = (proj_roughness2[:, 0] * proj_roughness2[:, 1]) \
+            + 2.0 * light_lobe_variance * (proj_roughness2[:, 0] * jj_mat_11 + proj_roughness2[:, 1] * jj_mat_22) \
+            + light_lobe_variance * light_lobe_variance * det_jj4
 
         # NDF filtering in a numerically stable manner
         # See the supplementary document (Section 5.2) of the paper for the derivation
         tr = filtered_proj_roughness_mat[:, 0, 0] + filtered_proj_roughness_mat[:, 1, 1]
-        condition = torch.isfinite(1.0 + tr + det)
-        flt_max = torch.finfo(torch.float32).max
-        flt_max_tensor = torch.tensor(flt_max, device=filtered_proj_roughness_mat.device)
-        diag_det = det[:, None, None] * torch.eye(2, device=filtered_proj_roughness_mat.device).expand(len(det), -1, -1)
-        filtered_proj_roughness_plus_det = filtered_proj_roughness_mat + diag_det
-        filtered_case_true = torch.minimum(filtered_proj_roughness_plus_det, flt_max_tensor) / (
-            1.0 + tr[:, None, None] + det[:, None, None]
+
+        # Проверяем, являются ли все элементы конечными
+        is_finite = torch.isfinite(1.0 + tr + det)
+        flt_max = torch.tensor(torch.finfo(torch.float32).max, device=det.device)
+        # Создаем новую матрицу
+        filtered_roughness_mat = torch.zeros_like(filtered_proj_roughness_mat)
+
+        # Если условие выполняется, используем первое выражение
+        filtered_roughness_mat[:, 0, 0] = torch.minimum(
+            filtered_proj_roughness_mat[:, 0, 0] + det,
+            flt_max
+        )
+        filtered_roughness_mat[:, 1, 1] = torch.minimum(
+            filtered_proj_roughness_mat[:, 1, 1] + det,
+            flt_max
         )
 
-        filtered_case_false = torch.zeros_like(filtered_proj_roughness_mat)
-        filtered_case_false[:, 0, 0] = torch.minimum(
-            filtered_proj_roughness_mat[:, 0, 0], flt_max_tensor
-        ) / torch.minimum(filtered_proj_roughness_mat[:, 0, 0] + 1.0, flt_max_tensor)
-        filtered_case_false[:, 1, 1] = torch.minimum(
-            filtered_proj_roughness_mat[:, 1, 1], flt_max_tensor
-        ) / torch.minimum(filtered_proj_roughness_mat[:, 1, 1] + 1.0, flt_max_tensor)
-
-        filtered_roughness_mat = torch.where(
-            condition[:, None, None], filtered_case_true, filtered_case_false
+        # Если условие не выполняется, используем второе выражение
+        # Применим это только к тем, для которых условие не выполнено
+        filtered_roughness_mat[~is_finite, 0, 0] = torch.minimum(
+            filtered_proj_roughness_mat[~is_finite, 0, 0],
+            flt_max
+        ) / torch.minimum(
+            filtered_proj_roughness_mat[~is_finite, 0, 0] + 1.0,
+            flt_max
         )
+
+        filtered_roughness_mat[~is_finite, 1, 1] = torch.minimum(
+            filtered_proj_roughness_mat[~is_finite, 1, 1],
+            flt_max
+        ) / torch.minimum(
+            filtered_proj_roughness_mat[~is_finite, 1, 1] + 1.0,
+            flt_max
+        )
+
+        # Выводим для отладки
+        #print("filtered roughness", filtered_roughness_mat.min(), filtered_roughness_mat.max())
 
         # visibility of the SG light in the upper hemisphere.
         visibility = vmf_hemispherical_integral(torch.sum(prod_dir * norm_tensor, dim=1), prod_sharpness)
-        print_tensor_stats(visibility)
+        print_tensor_stats(visibility, "visibility")
 
         # evaluate the filtered reflection lobe
         # FIXME: right now I make calulations in world space not in tangent
         light_lobe_axis_tf = si.sh_frame.to_local(mi.Vector3f(self.light_lobe_axis.permute(1, 0)))
         half_vec_unnormalize = wi_tensor + light_lobe_axis_tf.torch().permute(1, 0)
-        #half_vec_unnormalize = wi_tensor + self.light_lobe_axis
         half_vec = torch.nn.functional.normalize(half_vec_unnormalize, p=2, dim=1, eps=1e-6)
 
         lobe = sgg_reflection_pdf(wi_tensor, half_vec, filtered_roughness_mat).unsqueeze(1)
+        print_tensor_stats(lobe, "lobe")
 
         # TODO: there could be a problem
         sg_int = sg_integral(self.light_lobe_sharpness)
+        print_tensor_stats(sg_int, "sg int")
 
         # Create Glossy BSDF context
         ctx_specular = mi.BSDFContext()
         ctx_specular.type_mask = mi.BSDFFlags.Glossy
-        specular : mi.Color3f = bsdf.eval(ctx_specular, si, wo)
+        specular : mi.Spectrum = bsdf.eval(ctx_specular, si, wo)
         specular_tensor : torch.Tensor = specular.torch().permute(1, 0)
+        print_tensor_stats(specular_tensor, "bsdf specular")
 
         specular_illumination = amplitude * visibility * lobe * sg_int
         specular_illumination_result = specular_tensor * specular_illumination
         result = emissive * (diffuse_illumination_result + specular_illumination_result)
+        print_tensor_stats(result, "result")
 
         # Store illumination to calculate Loss later
         self.diffuse_illumination = diffuse_illumination_result
@@ -1076,7 +1096,7 @@ def get_all_gaussians(model):
     return gaussians, vmfs
 
 def print_tensor_stats(tensor, tensor_name="tensor"):
-    return
+    #return
     # TODO: add asserts for wrong tensors
     with torch.no_grad():
         if isinstance(tensor, torch.Tensor):
