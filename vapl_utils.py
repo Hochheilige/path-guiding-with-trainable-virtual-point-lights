@@ -541,7 +541,7 @@ class vapl_mixture:
         sampled_dir : torch.Tensor = sample_vmf(axis, sharpness[:, :1])
         return sampled_dir.permute(1, 0)
 
-    def convolve_with_bsdf(self, si : mi.SurfaceInteraction3f, ray_dir):
+    def convolve_with_bsdf(self, si : mi.SurfaceInteraction3f, view_dir : mi.Vector3f):
         SGLIGHT_SHARPNESS_MAX = float.fromhex("0x1.0p41")
 
         position  = si.p
@@ -550,6 +550,13 @@ class vapl_mixture:
         pos_tensor  = torch.from_numpy(position.numpy()).to("cuda").permute(1, 0)
         norm_tensor = torch.from_numpy(normal.numpy()).to("cuda").permute(1, 0)
         tangent_frame = mi.Frame3f(normal)
+
+        # Local outgoing direction
+        wo_world = (torch.nn.functional.normalize(-view_dir.torch().permute(1, 0), p=2, dim=1, eps=1e-6)).permute(1, 0)
+        wo = si.to_local(mi.Vector3f(wo_world))
+
+        # bsdf at the current intersection
+        bsdf: mi.BSDFPtr = si.bsdf()
 
         light_vec = self.mean - pos_tensor
         squared_distance = torch.sum(light_vec * light_vec, dim=1).unsqueeze(1)
@@ -569,21 +576,10 @@ class vapl_mixture:
         self.light_lobe_axis, self.light_lobe_sharpness, self.light_lobe_log_amplitude = sg_product(
             self.axis, self.sharpness.unsqueeze(1), light_dir, light_sharpness)
 
-        # bsdf at the current intersection
-        bsdf: mi.BSDFPtr = si.bsdf()
-
-        # Create BSDF contexts
+        # Create Diffuse BSDF context
         ctx_diffuse = mi.BSDFContext()
         ctx_diffuse.type_mask = mi.BSDFFlags.Diffuse
-        ctx_specular = mi.BSDFContext()
-        ctx_specular.type_mask = mi.BSDFFlags.Glossy
-
-        # Local outgoing direction
-        wo_world = (torch.nn.functional.normalize(-ray_dir.torch().permute(1, 0), p=2, dim=1, eps=1e-6)).permute(1, 0)
-        wo = si.to_local(mi.Vector3f(wo_world))
-
         diffuse : mi.Color3f = bsdf.eval(ctx_diffuse, si, wo)
-        specular : mi.Color3f = bsdf.eval(ctx_specular, si, wo)
 
         # Diffuse SG lighting.
 		# [Tokuyoshi et al. 2024 "Hierarchical Light Sampling with Accurate Spherical Gaussian Lighting", Section 4]
@@ -591,19 +587,15 @@ class vapl_mixture:
         cosine = torch.clamp(torch.sum(self.light_lobe_axis * norm_tensor, dim=1), -1.0, 1.0).unsqueeze(1)
 
         diffuse_illumination = amplitude * sg_clamp_cosine_product_integral_over_pi(cosine, self.light_lobe_sharpness)
-
         diffuse_tensor : torch.Tensor  = diffuse.torch().permute(1, 0)
-        specular_tensor : torch.Tensor = specular.torch().permute(1, 0)
-
         diffuse_illumination_result = diffuse_tensor * diffuse_illumination
 
         # Compute JJ^T for NDF filtering.
-
         # FIXME:
         # If use here si.to_local/tangent_frame.to_local it leads to nan/inf values for jacobian
         # but in original work they use const float3 wi = mul(tangentFrame, viewDir);
         #this could be correct but gives wi.z == 0 that break jacobian
-        wi = si.sh_frame.to_local(ray_dir)
+        wi = si.sh_frame.to_local(view_dir)
         # leave without tangent space for now
         #wi = ray_dir
         wi_tensor = wi.torch().permute(1, 0)
@@ -627,7 +619,7 @@ class vapl_mixture:
         roughness_max2 = torch.max(roughness, dim=-1, keepdim=True).values
         # FIXME: not sure but maybe sharpness too big
         reflect_sharpness = (1.0 - roughness_max2) / torch.maximum(2.0 * roughness_max2, torch.tensor(eps, device=roughness2.device))
-        reflect_vec_tensor = mi.reflect(-ray_dir, normal).torch().permute(1, 0)
+        reflect_vec_tensor = mi.reflect(-view_dir, normal).torch().permute(1, 0)
         reflect_vec = reflect_vec_tensor * reflect_sharpness
 
         # Glossy SG lighting.
@@ -686,6 +678,12 @@ class vapl_mixture:
 
         # TODO: there could be a problem
         sg_int = sg_integral(self.light_lobe_sharpness)
+
+        # Create Glossy BSDF context
+        ctx_specular = mi.BSDFContext()
+        ctx_specular.type_mask = mi.BSDFFlags.Glossy
+        specular : mi.Color3f = bsdf.eval(ctx_specular, si, wo)
+        specular_tensor : torch.Tensor = specular.torch().permute(1, 0)
 
         specular_illumination = amplitude * visibility * lobe * sg_int
         specular_illumination_result = specular_tensor * specular_illumination
@@ -1078,6 +1076,7 @@ def get_all_gaussians(model):
     return gaussians, vmfs
 
 def print_tensor_stats(tensor, tensor_name="tensor"):
+    return
     # TODO: add asserts for wrong tensors
     with torch.no_grad():
         if isinstance(tensor, torch.Tensor):
