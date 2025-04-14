@@ -219,11 +219,11 @@ def sggx(m: torch.Tensor, roughness_mat: torch.Tensor) -> torch.Tensor:
 # Approximate the reflection lobe with an SG lobe for microfacet BRDFs.
 # [Wang et al. 2009 "All-Frequency Rendering with Dynamic, Spatially-Varying Reflectance"]
 def sgg_reflection_pdf(wi: torch.Tensor, m: torch.Tensor, roughness_mat: torch.Tensor) -> torch.Tensor:
-    xy = wi[:2]
-    rough_wi = torch.matmul(roughness_mat, xy)
-    denom = torch.sqrt(torch.sum(xy * rough_wi) + wi[2] * wi[2])
+    xy = wi[..., :2]
+    rough_wi = torch.matmul(roughness_mat, xy.unsqueeze(-1)).squeeze(-1)
+    denom = torch.sqrt(torch.sum(xy * rough_wi, dim=-1) + wi[..., 2] ** 2)
     sggx_tensor = sggx(m, roughness_mat)
-    return sggx_tensor.unsqueeze(-1) / (4.0 * denom)
+    return sggx_tensor / (4.0 * denom)
 
 # Approximate hemispherical integral for a vMF distribution (i.e. normalized SG).
 # The parameter "cosine" is the cosine of the angle between the SG axis and the pole axis of the hemisphere.
@@ -323,9 +323,16 @@ def compute_filtered_roughness_mat(filtered_proj_roughness_mat, tr, det):
 # (exp(x) - 1)/x with cancellation of rounding errors.
 # [Nicholas J. Higham "Accuracy and Stability of Numerical Algorithms", Section 1.14.1, p. 19]
 def expm1_over_x(x: torch.Tensor) -> torch.Tensor:
-    y = torch.expm1(x)
-    result = y / x
-    result = torch.where(torch.abs(x) < 1.0, y / x, result)
+    u = torch.exp(x)
+    result = torch.zeros_like(x)
+    close_to_zero_mask = torch.isclose(u, torch.ones_like(u), atol=1e-6)
+    result[close_to_zero_mask] = 1.0
+    y = u - 1.0
+    small_x_mask = ~close_to_zero_mask & (torch.abs(x) < 1.0)
+    result[small_x_mask] = y[small_x_mask] / torch.log(u[small_x_mask])
+    large_x_mask = ~close_to_zero_mask & ~small_x_mask
+    result[large_x_mask] = y[large_x_mask] / x[large_x_mask]
+
     return result
 
 def sg_integral(sharpness):
@@ -600,9 +607,7 @@ class vapl_mixture:
         # leave without tangent space for now
         #wi = ray_dir
         wi_tensor = wi.torch().permute(1, 0)
-        print_tensor_stats(wi_tensor, "wi")
         jj_mat = compute_jacobian(wi_tensor)
-        #print("jjmat", jj_mat.min(), jj_mat.max())
 
         # Compute determinant of JJ^T
         eps = 1e-4
@@ -624,7 +629,6 @@ class vapl_mixture:
         reflect_sharpness = (1.0 - roughness_max2) / torch.maximum(2.0 * roughness_max2, torch.tensor(eps, device=roughness2.device))
         reflect_vec_tensor = mi.reflect(-ray_dir, normal).torch().permute(1, 0)
         reflect_vec = reflect_vec_tensor * reflect_sharpness
-        print_tensor_stats(reflect_vec, "reflect_vec")
 
         # Glossy SG lighting.
 		# [Tokuyoshi et al. 2024 "Hierarchical Light Sampling with Accurate Spherical Gaussian Lighting", Section 5]
@@ -633,11 +637,9 @@ class vapl_mixture:
         prod_dir = prod_vec / prod_sharpness
 
         light_lobe_variance = 1.0 / self.light_lobe_sharpness
-        diag_proj_roughness = torch.diag_embed(proj_roughness2.expand(-1, 2)) + 2.0
+        filtered_proj_roughness_mat = torch.diag(proj_roughness2) + 2.0 * light_lobe_variance.unsqueeze(-1) * jj_mat
 
-        filtered_proj_roughness_mat = batched_matmul(diag_proj_roughness * light_lobe_variance.unsqueeze(-1), jj_mat)
-
-        proj_roughness2 = (roughness2 / torch.maximum(1.0 - roughness2, torch.tensor(eps, device=roughness2.device))).expand(-1, 2)
+        proj_roughness2 = (roughness2 / torch.maximum(1.0 - roughness2, torch.tensor(eps, device=roughness2.device)))
 
         # Compute the determinant of filteredProjRoughnessMat in a numerically stable manner.
 		# See the supplementary document (Section 5.2) of the paper for the derivation.
@@ -647,35 +649,46 @@ class vapl_mixture:
 
         # NDF filtering in a numerically stable manner
         # See the supplementary document (Section 5.2) of the paper for the derivation
-        tr = torch.einsum("bii->b", filtered_proj_roughness_mat)
-        filtered_roughness_mat = compute_filtered_roughness_mat(filtered_proj_roughness_mat, tr, det)
+        tr = filtered_proj_roughness_mat[:, 0, 0] + filtered_proj_roughness_mat[:, 1, 1]
+        condition = torch.isfinite(1.0 + tr + det)
+        flt_max = torch.finfo(torch.float32).max
+        flt_max_tensor = torch.tensor(flt_max, device=filtered_proj_roughness_mat.device)
+        diag_det = det[:, None, None] * torch.eye(2, device=filtered_proj_roughness_mat.device).expand(len(det), -1, -1)
+        filtered_proj_roughness_plus_det = filtered_proj_roughness_mat + diag_det
+        filtered_case_true = torch.minimum(filtered_proj_roughness_plus_det, flt_max_tensor) / (
+            1.0 + tr[:, None, None] + det[:, None, None]
+        )
+
+        filtered_case_false = torch.zeros_like(filtered_proj_roughness_mat)
+        filtered_case_false[:, 0, 0] = torch.minimum(
+            filtered_proj_roughness_mat[:, 0, 0], flt_max_tensor
+        ) / torch.minimum(filtered_proj_roughness_mat[:, 0, 0] + 1.0, flt_max_tensor)
+        filtered_case_false[:, 1, 1] = torch.minimum(
+            filtered_proj_roughness_mat[:, 1, 1], flt_max_tensor
+        ) / torch.minimum(filtered_proj_roughness_mat[:, 1, 1] + 1.0, flt_max_tensor)
+
+        filtered_roughness_mat = torch.where(
+            condition[:, None, None], filtered_case_true, filtered_case_false
+        )
 
         # visibility of the SG light in the upper hemisphere.
         visibility = vmf_hemispherical_integral(torch.sum(prod_dir * norm_tensor, dim=1), prod_sharpness)
         print_tensor_stats(visibility)
 
         # evaluate the filtered reflection lobe
-        # FIXME: right now I make calulations in workd space not in tangent
+        # FIXME: right now I make calulations in world space not in tangent
         light_lobe_axis_tf = si.sh_frame.to_local(mi.Vector3f(self.light_lobe_axis.permute(1, 0)))
         half_vec_unnormalize = wi_tensor + light_lobe_axis_tf.torch().permute(1, 0)
         #half_vec_unnormalize = wi_tensor + self.light_lobe_axis
-        print_tensor_stats(half_vec_unnormalize, "half vec unnorm")
         half_vec = torch.nn.functional.normalize(half_vec_unnormalize, p=2, dim=1, eps=1e-6)
-        print_tensor_stats(half_vec, "half vec")
 
-        lobe = sgg_reflection_pdf(wi_tensor, half_vec, filtered_roughness_mat)
-        print_tensor_stats(lobe, "lobe")
+        lobe = sgg_reflection_pdf(wi_tensor, half_vec, filtered_roughness_mat).unsqueeze(1)
 
         # TODO: there could be a problem
         sg_int = sg_integral(self.light_lobe_sharpness)
-        print_tensor_stats(sg_int, "sg_int")
 
         specular_illumination = amplitude * visibility * lobe * sg_int
-        print_tensor_stats(specular_illumination, "specular illumination")
-        print_tensor_stats(specular_tensor, "specular bsdf")
-        specular_illumination_result = specular_tensor * specular_illumination * 1000
-        print_tensor_stats(specular_illumination_result, "specuar result")
-        print_tensor_stats(diffuse_illumination_result, "diffuse res")
+        specular_illumination_result = specular_tensor * specular_illumination
         result = emissive * (diffuse_illumination_result + specular_illumination_result)
 
         # Store illumination to calculate Loss later
@@ -1065,7 +1078,6 @@ def get_all_gaussians(model):
     return gaussians, vmfs
 
 def print_tensor_stats(tensor, tensor_name="tensor"):
-    return
     # TODO: add asserts for wrong tensors
     with torch.no_grad():
         if isinstance(tensor, torch.Tensor):
