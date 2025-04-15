@@ -88,7 +88,8 @@ class vapl_grid(torch.nn.Module):
         #mean = gaussians[:, :3]
         mean = (gaussians[:, :3] / eps * 0.5 + 0.5) * (bb_max - bb_min) + bb_min
         variance = torch.exp(gaussians[:, 3]).unsqueeze(1)
-        sharpness = torch.exp(vmf[:, 0]).unsqueeze(1)
+        sharpness = torch.nn.functional.softplus(vmf[:, 0]).unsqueeze(1)
+        #sharpness = vmf[:, 0].unsqueeze(1)
 
         axis = torch.nn.functional.normalize(vmf[:, 1:4], p=2, dim=1, eps=1e-6)
         amplitude = torch.sigmoid(vmf[:, 4:7])
@@ -539,15 +540,17 @@ class vapl_mixture:
         eps = 1e-4
 
         position  = si.p
-        normal    = si.n
-
+        normal    = si.sh_frame.to_local(si.n)
         pos_tensor  = torch.from_numpy(position.numpy()).to("cuda").permute(1, 0)
         norm_tensor = torch.from_numpy(normal.numpy()).to("cuda").permute(1, 0)
-        tangent_frame = mi.Frame3f(normal)
 
         # Local outgoing direction
         wo_world = (torch.nn.functional.normalize(-view_dir.torch().permute(1, 0), p=2, dim=1, eps=1e-6)).permute(1, 0)
-        wo = si.to_local(mi.Vector3f(wo_world))
+        wi_world = (torch.nn.functional.normalize(view_dir.torch().permute(1, 0), p=2, dim=1, eps=1e-6)).permute(1, 0)
+        wo = si.sh_frame.to_local(mi.Vector3f(wo_world))
+        wi = si.sh_frame.to_local(mi.Vector3f(wi_world))
+        wi_tensor = wi.torch().permute(1, 0)
+        wo_tensor = wo.torch().permute(1, 0)
 
         # bsdf at the current intersection
         bsdf: mi.BSDFPtr = si.bsdf()
@@ -585,12 +588,6 @@ class vapl_mixture:
         diffuse_illumination_result = diffuse_tensor * diffuse_illumination
 
         # Compute JJ^T for NDF filtering.
-        # FIXME:
-        # If use here si.to_local/tangent_frame.to_local it leads to nan/inf values for jacobian
-        # but in original work they use const float3 wi = mul(tangentFrame, viewDir);
-        #this could be correct but gives wi.z == 0 that break jacobian
-        wi = si.sh_frame.to_local(view_dir)
-        wi_tensor = wi.torch().permute(1, 0)
         mask = wi_tensor[:, 2] == 0
         wi_tensor[mask] += eps
 
@@ -606,7 +603,7 @@ class vapl_mixture:
         roughness_max2 = torch.max(roughness, dim=-1, keepdim=True).values
 
         reflect_sharpness = (1.0 - roughness_max2) / torch.maximum(2.0 * roughness_max2, torch.tensor(eps, device=roughness2.device))
-        reflect_vec_tensor = mi.reflect(-view_dir, normal).torch().permute(1, 0)
+        reflect_vec_tensor = mi.reflect(wo, normal).torch().permute(1, 0)
         reflect_vec = reflect_vec_tensor * reflect_sharpness
 
         # Glossy SG lighting.
@@ -1096,7 +1093,7 @@ def get_all_gaussians(model):
     return gaussians, vmfs
 
 def print_tensor_stats(tensor, tensor_name="tensor"):
-    #return
+    return
     # TODO: add asserts for wrong tensors
     with torch.no_grad():
         if isinstance(tensor, torch.Tensor):
