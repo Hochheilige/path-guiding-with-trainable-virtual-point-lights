@@ -88,8 +88,8 @@ class vapl_grid(torch.nn.Module):
         #mean = gaussians[:, :3]
         mean = (gaussians[:, :3] / eps * 0.5 + 0.5) * (bb_max - bb_min) + bb_min
         variance = torch.exp(gaussians[:, 3]).unsqueeze(1)
-        sharpness = torch.nn.functional.softplus(vmf[:, 0]).unsqueeze(1)
-        #sharpness = vmf[:, 0].unsqueeze(1)
+        #sharpness = torch.nn.functional.softplus(vmf[:, 0]).unsqueeze(1)
+        sharpness = vmf[:, 0].unsqueeze(1)
 
         axis = torch.nn.functional.normalize(vmf[:, 1:4], p=2, dim=1, eps=1e-6)
         amplitude = torch.sigmoid(vmf[:, 4:7])
@@ -113,7 +113,7 @@ class vapl_grid_mlp(torch.nn.Module):
                 "n_levels": num_gaussian_in_mixture,
                 "n_features_per_level": num_param_per_gaussian,
                 "log2_hashmap_size": 22,
-                "interpolation": "Nearest"
+                "interpolation": "Linear"
             },
         }
         n_input_dims = 3
@@ -355,8 +355,8 @@ def isotropic_ndf_filtering(si: mi.SurfaceInteraction3f):
     mask = si.is_valid()
 
     # alpha_u and alpha_v are anisotropic roughness parameters
-    alpha_u = torch.tensor(si.bsdf().eval_attribute_1("alpha_u", si, mask), dtype=torch.float32, device="cuda")
-    alpha_v = torch.tensor(si.bsdf().eval_attribute_1("alpha_v", si, mask), dtype=torch.float32, device="cuda")
+    alpha_u = si.bsdf().eval_attribute_1("alpha_u", si).torch()
+    alpha_v = si.bsdf().eval_attribute_1("alpha_v", si).torch()
 
     # [N, 1] kernel roughness from Eq.14
     kernel_roughness2 = SIGMA2 * (torch.sum(dndu * dndu, dim=-1) + torch.sum(dndv * dndv, dim=-1))  # [N]
@@ -365,7 +365,6 @@ def isotropic_ndf_filtering(si: mi.SurfaceInteraction3f):
     # Roughness as [N, 2] (u and v)
     roughness = torch.stack([alpha_u, alpha_v], dim=-1)  # [N, 2]
     filtered_roughness2 = torch.clamp(roughness ** 2 + clamped_kernel_roughness2, min=0.0, max=1.0)  # [N, 2]
-
     return torch.sqrt(filtered_roughness2)
 
 def compute_filtered_roughness_mat(filtered_proj_roughness_mat, tr, det):
@@ -613,17 +612,16 @@ class vapl_mixture:
         eps = 1e-4
 
         position  = si.p
-        normal    = si.sh_frame.to_local(si.n)
+        normal    = si.n
         pos_tensor  = position.torch().permute(1, 0)
         norm_tensor = normal.torch().permute(1, 0)
 
-        # Local outgoing direction
-        wo_world = (torch.nn.functional.normalize(-view_dir.torch().permute(1, 0), p=2, dim=1, eps=1e-6)).permute(1, 0)
-        wi_world = (torch.nn.functional.normalize(view_dir.torch().permute(1, 0), p=2, dim=1, eps=1e-6)).permute(1, 0)
-        wo = si.sh_frame.to_local(mi.Vector3f(wo_world))
-        wi = si.sh_frame.to_local(mi.Vector3f(wi_world))
+        view_dir_normalize = (torch.nn.functional.normalize(view_dir.torch().permute(1, 0), p=2, dim=1, eps=1e-6))
+        wo_world = -view_dir_normalize
+        wi_world = view_dir_normalize
+        wo = mi.Vector3f(wo_world.permute(1, 0))
+        wi = si.sh_frame.to_local(mi.Vector3f(wi_world.permute(1, 0)))
         wi_tensor = wi.torch().permute(1, 0)
-        wo_tensor = wo.torch().permute(1, 0)
 
         # bsdf at the current intersection
         bsdf: mi.BSDFPtr = si.bsdf()
@@ -1032,6 +1030,7 @@ class RHSIntegrator(ADIntegrator):
         si = scene.ray_intersect(
             ray, ray_flags=mi.RayFlags.All, coherent=(depth==0)
         )
+        si.compute_uv_partials(ray)
 
         gaussians, vmfs = self.model(si)
         mixture = vapl_mixture(gaussians, vmfs)
