@@ -99,6 +99,79 @@ class vapl_grid(torch.nn.Module):
 
         return gaussians, vmf
 
+class vapl_grid_mlp(torch.nn.Module):
+    def __init__(self, bb_min, bb_max, num_gaussian_in_mixture, num_param_per_gaussian, num_param_per_vmf):
+        super().__init__()
+
+        self.bb_min = bb_min
+        self.bb_max = bb_max
+
+        config = {
+            "encoding": {
+                "otype": "HashGrid",
+                "base_resolution": 16,
+                "n_levels": num_gaussian_in_mixture,
+                "n_features_per_level": num_param_per_gaussian,
+                "log2_hashmap_size": 22,
+                "interpolation": "Nearest"
+            },
+        }
+        n_input_dims = 3
+        self.gaussian_grid = tcnn.Encoding(n_input_dims, config["encoding"])
+
+        config["encoding"]["n_features_per_level"] = num_param_per_vmf
+        self.vmf_grid = tcnn.Encoding(n_input_dims, config["encoding"])
+
+        layers = []
+        input_dim = num_param_per_gaussian + num_param_per_vmf
+        hidden_dim = 32
+        output_dim = 11
+
+        for _ in range(1):
+            layers.append(torch.nn.Linear(input_dim, hidden_dim))
+            layers.append(torch.nn.LeakyReLU(negative_slope=0.2))
+            input_dim = hidden_dim
+
+        layers.append(torch.nn.Linear(hidden_dim, output_dim))
+        self.fc = torch.nn.Sequential(*layers)
+
+        self.optimizer = torch.optim.Adam(
+            list(self.gaussian_grid.parameters()) +
+            list(self.vmf_grid.parameters()) +
+            list(self.fc.parameters()),
+            lr=0.001
+        )
+
+    def forward(self, input):
+        bb_min = torch.tensor(self.bb_min, device="cuda")
+        bb_max = torch.tensor(self.bb_max, device="cuda")
+
+        if isinstance(input, mi.SurfaceInteraction3f):
+            pos = input.p.torch().permute(1, 0)
+        elif isinstance(input, torch.Tensor):
+            pos = input
+
+        X = (pos - bb_min) / (bb_max - bb_min)
+
+        gaussians = self.gaussian_grid(X).to(dtype=torch.float32)
+        vmf = self.vmf_grid(X).to(dtype=torch.float32)
+        grid_output = torch.cat([gaussians, vmf], dim=1)
+
+        outputs = self.fc(grid_output)
+
+        eps = 1
+        mean = (outputs[:, :3] / eps * 0.5 + 0.5) * (bb_max - bb_min) + bb_min
+        variance = torch.nn.functional.relu(outputs[:, 3:4])
+        sharpness = torch.nn.functional.relu(outputs[:, 4:5])
+
+        axis = torch.nn.functional.normalize(outputs[:, 5:8], p=2, dim=1, eps=1e-6)
+        amplitude = torch.sigmoid(outputs[:, 8:11])
+
+        gaussians_out = torch.cat([mean, variance], dim=1)
+        vmf_out = torch.cat([sharpness, axis, amplitude], dim=1)
+
+        return gaussians_out, vmf_out
+
 # Test function to see scene-ray intersection
 def get_camera_first_bounce(scene):
     cam_origin = mi.Point3f(0, 1, 3)
@@ -541,8 +614,8 @@ class vapl_mixture:
 
         position  = si.p
         normal    = si.sh_frame.to_local(si.n)
-        pos_tensor  = torch.from_numpy(position.numpy()).to("cuda").permute(1, 0)
-        norm_tensor = torch.from_numpy(normal.numpy()).to("cuda").permute(1, 0)
+        pos_tensor  = position.torch().permute(1, 0)
+        norm_tensor = normal.torch().permute(1, 0)
 
         # Local outgoing direction
         wo_world = (torch.nn.functional.normalize(-view_dir.torch().permute(1, 0), p=2, dim=1, eps=1e-6)).permute(1, 0)
@@ -1077,7 +1150,7 @@ def pix_coord(scene, batch, h, w):
 
 def get_all_gaussians(model):
     resolution = 16
-    device = model.gaussian_grid.parameters().__next__().device
+    device = "cuda"
 
     lin = torch.linspace(0, 1, resolution, device=device)
     X, Y, Z = torch.meshgrid(lin, lin, lin, indexing='ij')
