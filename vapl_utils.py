@@ -51,6 +51,7 @@ class vapl_grid(torch.nn.Module):
                 "n_levels": num_gaussian_in_mixture,
                 "n_features_per_level": num_param_per_gaussian,
                 "log2_hashmap_size": 22,
+                "interpolation": "Nearest"
             },
         }
         n_input_dims = 3
@@ -75,13 +76,16 @@ class vapl_grid(torch.nn.Module):
         bb_max = torch.tensor(self.bb_max, device="cuda")
 
         if isinstance(input, mi.SurfaceInteraction3f):
-            pos = torch.from_numpy(input.p.numpy()).to("cuda").permute(1, 0)
+            pos = input.p.torch().permute(1, 0)
         elif isinstance(input, torch.Tensor):
             pos = input
 
-        X = (pos - bb_min) / (bb_max - bb_min)
-        gaussians : torch.Tensor = self.gaussian_grid(X).to(dtype=torch.float32)
-        vmf : torch.Tensor = self.vmf_grid(X).to(dtype=torch.float32)
+        #X = (pos - bb_min) / (bb_max - bb_min)
+
+        #gaussians : torch.Tensor = self.gaussian_grid(X).to(dtype=torch.float32)
+        #vmf : torch.Tensor = self.vmf_grid(X).to(dtype=torch.float32)
+
+        gaussians, vmf = self.sample_vpls(pos)
 
         eps = 1e-2
 
@@ -89,15 +93,47 @@ class vapl_grid(torch.nn.Module):
         mean = (gaussians[:, :3] / eps * 0.5 + 0.5) * (bb_max - bb_min) + bb_min
         variance = torch.exp(gaussians[:, 3]).unsqueeze(1)
         #sharpness = torch.nn.functional.softplus(vmf[:, 0]).unsqueeze(1)
-        sharpness = vmf[:, 0].unsqueeze(1)
+        sharpness = torch.exp(vmf[:, 0]).unsqueeze(1)
 
+        theta = torch.sigmoid(vmf[:, 1])
+        phi   = torch.sigmoid(vmf[:, 2])
+        # axis = torch.stack([
+        #     torch.sin(theta) * torch.cos(phi),
+        #     torch.sin(theta) * torch.sin(phi),
+        #     torch.cos(theta)]).permute(1, 0)
         axis = torch.nn.functional.normalize(vmf[:, 1:4], p=2, dim=1, eps=1e-6)
-        amplitude = torch.sigmoid(vmf[:, 4:7])
+        amplitude = torch.nn.functional.softplus(vmf[:, 4:7])
 
         gaussians = torch.cat([mean, variance], dim = 1)
         vmf = torch.cat([sharpness, axis, amplitude], dim = 1)
 
         return gaussians, vmf
+
+    def sample_vpls(self, pos):
+        bb_min = torch.tensor(self.bb_min, device="cuda")
+        bb_max = torch.tensor(self.bb_max, device="cuda")
+        block_size = 1.0 / 16.0
+        normalized_pos = (pos - bb_min) / (bb_max - bb_min)
+
+        total_gaussians = None
+        total_vmf = None
+
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                for dz in [-1, 0, 1]:
+                    offset = torch.tensor([dx, dy, dz], device="cuda") * block_size
+                    neighbor_pos = normalized_pos + offset
+
+                    gaussians = self.gaussian_grid(neighbor_pos).to(dtype=torch.float32)
+                    vmf = self.vmf_grid(neighbor_pos).to(dtype=torch.float32)
+
+                    if total_gaussians is None:
+                        total_gaussians = torch.zeros_like(gaussians)
+                        total_vmf = torch.zeros_like(vmf)
+                    total_gaussians += gaussians
+                    total_vmf += vmf
+
+        return total_gaussians, total_vmf
 
 class vapl_grid_mlp(torch.nn.Module):
     def __init__(self, bb_min, bb_max, num_gaussian_in_mixture, num_param_per_gaussian, num_param_per_vmf):
@@ -113,7 +149,7 @@ class vapl_grid_mlp(torch.nn.Module):
                 "n_levels": num_gaussian_in_mixture,
                 "n_features_per_level": num_param_per_gaussian,
                 "log2_hashmap_size": 22,
-                "interpolation": "Linear"
+                "interpolation": "Nearest"
             },
         }
         n_input_dims = 3
@@ -127,7 +163,7 @@ class vapl_grid_mlp(torch.nn.Module):
         hidden_dim = 32
         output_dim = 11
 
-        for _ in range(1):
+        for _ in range(3):
             layers.append(torch.nn.Linear(input_dim, hidden_dim))
             layers.append(torch.nn.LeakyReLU(negative_slope=0.2))
             input_dim = hidden_dim
@@ -160,7 +196,7 @@ class vapl_grid_mlp(torch.nn.Module):
         outputs = self.fc(grid_output)
 
         eps = 1
-        mean = (outputs[:, :3] / eps * 0.5 + 0.5) * (bb_max - bb_min) + bb_min
+        mean = torch.sigmoid(outputs[:, :3]) * (bb_max - bb_min) + bb_min
         variance = torch.nn.functional.relu(outputs[:, 3:4])
         sharpness = torch.nn.functional.relu(outputs[:, 4:5])
 
@@ -357,6 +393,11 @@ def isotropic_ndf_filtering(si: mi.SurfaceInteraction3f):
     # alpha_u and alpha_v are anisotropic roughness parameters
     alpha_u = si.bsdf().eval_attribute_1("alpha_u", si).torch()
     alpha_v = si.bsdf().eval_attribute_1("alpha_v", si).torch()
+    # if torch.all(alpha_u == 0) and torch.all(alpha_v == 0):
+    #     alpha = si.bsdf().eval_attribute_1("alpha", si).torch()
+    #     alpha_u = alpha
+    #     alpha_v = alpha
+
 
     # [N, 1] kernel roughness from Eq.14
     kernel_roughness2 = SIGMA2 * (torch.sum(dndu * dndu, dim=-1) + torch.sum(dndv * dndv, dim=-1))  # [N]
