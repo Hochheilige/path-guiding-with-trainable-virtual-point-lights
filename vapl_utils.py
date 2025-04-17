@@ -37,11 +37,12 @@ Going to call Gaussian vMF pair - Virtual Anisotropic Point Light - VAPL
 
 
 class vapl_grid(torch.nn.Module):
-    def __init__(self, bb_min, bb_max, num_gaussian_in_mixture, num_param_per_gaussian, num_param_per_vmf):
+    def __init__(self, bb_min, bb_max, num_gaussian_in_mixture, num_param_per_gaussian, num_param_per_vmf, sweep_config = None):
         super().__init__()
 
         self.bb_min = bb_min
         self.bb_max = bb_max
+        self.sweep_config = sweep_config
 
         # tiny-cuda-nn config for hash grid
         config = {
@@ -60,12 +61,13 @@ class vapl_grid(torch.nn.Module):
         config["encoding"]["n_features_per_level"] = num_param_per_vmf
         self.vmf_grid = tcnn.Encoding(n_input_dims, config["encoding"])
 
-        # lr = 0.01 - immediately crash
-        # lr = 0.001 - works okay most of the time
-        # lr = 0.0001 - gives interesting results
+        learning_rate = 0.001
+        if self.sweep_config != None:
+            learning_rate = sweep_config.learning_rate
+
         self.optimizer = torch.optim.Adam(
             list(self.gaussian_grid.parameters()) + list(self.vmf_grid.parameters()),
-            lr=0.001
+            lr=learning_rate
         )
 
         # It is possible to change learning rate during training
@@ -80,29 +82,43 @@ class vapl_grid(torch.nn.Module):
         elif isinstance(input, torch.Tensor):
             pos = input
 
+        # TODO: add parameter to switch between accumulated/regular vapls
         #X = (pos - bb_min) / (bb_max - bb_min)
-
         #gaussians : torch.Tensor = self.gaussian_grid(X).to(dtype=torch.float32)
         #vmf : torch.Tensor = self.vmf_grid(X).to(dtype=torch.float32)
 
         gaussians, vmf = self.sample_vpls(pos)
 
-        eps = 1e-2
+        if self.sweep_config != None:
+            if (self.sweep_config.gaussian_mean_encoding == "raw"):
+                mean = encoders[self.sweep_config.gaussian_mean_encoding](gaussians[:, :3])
+            else:
+                mean = encoders[self.sweep_config.gaussian_mean_encoding](gaussians[:, :3]) * (bb_max - bb_min) + bb_min
 
-        #mean = gaussians[:, :3]
-        mean = (gaussians[:, :3] / eps * 0.5 + 0.5) * (bb_max - bb_min) + bb_min
-        variance = torch.exp(gaussians[:, 3]).unsqueeze(1)
-        #sharpness = torch.nn.functional.softplus(vmf[:, 0]).unsqueeze(1)
-        sharpness = torch.exp(vmf[:, 0]).unsqueeze(1)
+            variance = encoders[self.sweep_config.gaussian_variance_encoding](gaussians[:, 3]).unsqueeze(1)
+            sharpness = encoders[self.sweep_config.vmf_sharpness_encoding](vmf[:, 0]).unsqueeze(1)
 
-        theta = torch.sigmoid(vmf[:, 1])
-        phi   = torch.sigmoid(vmf[:, 2])
-        # axis = torch.stack([
-        #     torch.sin(theta) * torch.cos(phi),
-        #     torch.sin(theta) * torch.sin(phi),
-        #     torch.cos(theta)]).permute(1, 0)
-        axis = torch.nn.functional.normalize(vmf[:, 1:4], p=2, dim=1, eps=1e-6)
-        amplitude = torch.nn.functional.softplus(vmf[:, 4:7])
+            if (self.sweep_config.vmf_axis_encoding == "sperical" or self.sweep_config.vmf_axis_encoding == "spherical-norm"):
+                axis = encoders[self.sweep_config.vmf_axis_encoding](vmf[:, 1:3])
+                amplitude = encoders[self.sweep_config.vmf_amplitude_encoding](vmf[:, 3:6])
+            else:
+                axis = encoders[self.sweep_config.vmf_axis_encoding](vmf[:, 1:4])
+                amplitude = encoders[self.sweep_config.vmf_amplitude_encoding](vmf[:, 4:7])
+        else:
+            mean = (gaussians[:, :3] - gaussians[:, :3].min()) / (gaussians[:, :3].max() - gaussians[:, :3].min())
+            mean = mean * (bb_max - bb_min) + bb_min
+            variance = torch.exp(gaussians[:, 3]).unsqueeze(1)
+            sharpness = torch.sigmoid(vmf[:, 0]).unsqueeze(1)
+
+            #theta = torch.sigmoid(vmf[:, 1])
+            #phi   = torch.sigmoid(vmf[:, 2])
+            #axis = torch.stack([
+            #     torch.sin(theta) * torch.cos(phi),
+            #     torch.sin(theta) * torch.sin(phi),
+            #     torch.cos(theta)]).permute(1, 0)
+            #axis = torch.nn.functional.normalize(axis, p=2, dim=1, eps=1e-6)
+            axis = vmf[:, 1:4]
+            amplitude = torch.exp(vmf[:, 4:67])
 
         gaussians = torch.cat([mean, variance], dim = 1)
         vmf = torch.cat([sharpness, axis, amplitude], dim = 1)
@@ -353,8 +369,9 @@ def vmf_hemispherical_integral(cosine : torch.Tensor, sharpness : torch.Tensor):
     return torch.lerp(e, one_tensor, lerp_factor) / (e + 1.0)
 
 def luminance(color: torch.Tensor):
-    weights = torch.tensor([0.2126, 0.7152, 0.0722], device=color.device)
-    return torch.sum(color * weights, dim=1)
+    with torch.no_grad():
+        weights = torch.tensor([0.2126, 0.7152, 0.0722], device=color.device)
+        return torch.sum(color * weights, dim=1)
 
 def compute_jacobian(wi_tensor: torch.Tensor):
     vlen = torch.norm(wi_tensor[:, :2], dim=1)
@@ -1189,21 +1206,22 @@ def pix_coord(scene, batch, h, w):
     return ndc_to_pixel(world_to_ndc(scene, batch), h, w)
 
 def get_all_gaussians(model):
-    resolution = 16
-    device = "cuda"
+    with torch.no_grad():
+        resolution = 4
+        device = "cuda"
 
-    lin = torch.linspace(0, 1, resolution, device=device)
-    X, Y, Z = torch.meshgrid(lin, lin, lin, indexing='ij')
+        lin = torch.linspace(0, 1, resolution, device=device)
+        X, Y, Z = torch.meshgrid(lin, lin, lin, indexing='ij')
 
-    grid_points = torch.stack([X.flatten(), Y.flatten(), Z.flatten()], dim=-1)
+        grid_points = torch.stack([X.flatten(), Y.flatten(), Z.flatten()], dim=-1)
 
-    bb_min = torch.tensor(model.bb_min, device=device)
-    bb_max = torch.tensor(model.bb_max, device=device)
-    world_positions : torch.Tensor = grid_points * (bb_max - bb_min) + bb_min
+        bb_min = torch.tensor(model.bb_min, device=device)
+        bb_max = torch.tensor(model.bb_max, device=device)
+        world_positions : torch.Tensor = grid_points * (bb_max - bb_min) + bb_min
 
-    gaussians, vmfs = model(world_positions)
+        gaussians, vmfs = model(world_positions)
 
-    return gaussians, vmfs
+        return gaussians, vmfs
 
 def print_tensor_stats(tensor, tensor_name="tensor"):
     return
@@ -1221,3 +1239,40 @@ def print_tensor_stats(tensor, tensor_name="tensor"):
                 print("Tensor must have shape (N, 1) or (N, 3).")
         else:
             print("Input is not a valid torch tensor.")
+
+import torch.nn.functional as F
+
+def minmaxnorm(x):
+    return (x - x.min()) / (x.max() - x.min())
+
+def eps_norm(x):
+    eps = 1e-2
+    return x / eps * 0.5 - 0.5
+
+def spherical(x):
+    theta = torch.sigmoid(x[:, 0])
+    phi   = torch.sigmoid(x[:, 1])
+    axis = torch.stack([
+             torch.sin(theta) * torch.cos(phi),
+             torch.sin(theta) * torch.sin(phi),
+             torch.cos(theta)]).permute(1, 0)
+    return axis
+
+
+def spherical_norm(x):
+    return F.normalize(spherical(x))
+
+encoders = {
+    "log": torch.log,
+    "exp": torch.exp,
+    "relu": torch.relu,
+    "sigmoid": torch.sigmoid,
+    "relu": torch.relu,
+    "softplus": F.softplus,
+    "normalize": F.normalize,
+    "spherical": spherical,
+    "spherical-norm": spherical_norm,
+    "eps-norm" : eps_norm,
+    "min-max-norm": minmaxnorm,
+    "raw": lambda x: x,
+}
