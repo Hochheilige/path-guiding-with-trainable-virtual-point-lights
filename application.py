@@ -49,11 +49,11 @@ class Application:
             wandb.init(project="vapls-parameters-encodings-search")
             self.config.sweep_config = wandb.config
             self.train()
-        
+
     def train(self):
         if self.config.mode == "wandb":
             wandb.init(
-                project="vapls-training", 
+                project="vapls-training",
                 name=self.config.run_name,
                 config=self.config
             )
@@ -61,14 +61,13 @@ class Application:
         for epoch in range(self.config.epoch):
             self.integrator.epoch = epoch
             image = mi.render(self.scene, spp=self.config.spp, integrator=self.integrator)
-            if self.config.mode != "sweep":
-                self.render(epoch, image)
-        
+            self.render(epoch, image)
+
         if self.config.mode == "wandb":
             wandb.finish()
 
     def render(self, epoch, image):
-        if (self.config.mode == "wandb"):
+        if (self.config.mode == "wandb" or self.config.mode == "sweep"):
             wandb.log({"loss": self.integrator.losses[-1].item(), "epoch": epoch})
 
         if (self.should_render(epoch)):
@@ -99,6 +98,9 @@ class Application:
                     wandb.log({"vapl training": wandb.Image(fig)})
 
     def should_render(self, epoch):
+        if self.config.mode == "sweep":
+            return False
+
         if epoch < 50:
             return epoch % 5 == 0
         elif epoch < 500:
@@ -107,25 +109,25 @@ class Application:
             return epoch % 100 == 0
         else:
             return epoch % 250 == 0
-        
+
     def debug_vapl_render(self, scene, pos, variance, amplitude, axis, h, w, ax):
         p = pos.cpu().detach().numpy()
         variance = variance.cpu().detach().numpy().flatten()
         amplitude = amplitude.cpu().detach().numpy()
-        means_ndc = world_to_ndc(scene, p)  
+        means_ndc = world_to_ndc(scene, p)
         means_pix = ndc_to_pixel(means_ndc, h, w)
-    
+
         amplitude_norm = amplitude / amplitude.max() if amplitude.max() != 0 else amplitude
         colors = amplitude_norm
-    
+
         point_sizes = 10 * variance
-    
+
         axis_nds = world_to_ndc(scene, axis.cpu().detach().numpy())
         axis_pix = ndc_to_pixel(axis_nds, h, w)
-    
+
         dx = axis_pix.x - means_pix.x
         dy = axis_pix.y - means_pix.y
-    
+
         ax.scatter(means_pix.x, means_pix.y, c=colors, cmap='coolwarm', marker='o', s=point_sizes)
         # TODO: figure out how to render arrows more correct
         #ax.quiver(means_pix.x, means_pix.y, dx, dy, angles='uv', color=colors, scale=1, scale_units='xy')
