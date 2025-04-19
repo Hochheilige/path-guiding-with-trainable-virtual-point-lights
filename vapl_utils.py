@@ -118,7 +118,7 @@ class vapl_grid(torch.nn.Module):
             #     torch.cos(theta)]).permute(1, 0)
             #axis = torch.nn.functional.normalize(axis, p=2, dim=1, eps=1e-6)
             axis = vmf[:, 1:4]
-            amplitude = torch.exp(vmf[:, 4:67])
+            amplitude = torch.exp(vmf[:, 4:7])
 
         gaussians = torch.cat([mean, variance], dim = 1)
         vmf = torch.cat([sharpness, axis, amplitude], dim = 1)
@@ -131,21 +131,21 @@ class vapl_grid(torch.nn.Module):
         block_size = 1.0 / 16.0
         normalized_pos = (pos - bb_min) / (bb_max - bb_min)
 
-        total_gaussians = None
-        total_vmf = None
+        total_gaussians = self.gaussian_grid(normalized_pos).to(dtype=torch.float32)
+        total_vmf = self.vmf_grid(normalized_pos).to(dtype=torch.float32)
 
         for dx in [-1, 0, 1]:
             for dy in [-1, 0, 1]:
                 for dz in [-1, 0, 1]:
+                    if dx==0 and dy==0 and dz==0:
+                        continue
+
                     offset = torch.tensor([dx, dy, dz], device="cuda") * block_size
                     neighbor_pos = normalized_pos + offset
 
                     gaussians = self.gaussian_grid(neighbor_pos).to(dtype=torch.float32)
                     vmf = self.vmf_grid(neighbor_pos).to(dtype=torch.float32)
 
-                    if total_gaussians is None:
-                        total_gaussians = torch.zeros_like(gaussians)
-                        total_vmf = torch.zeros_like(vmf)
                     total_gaussians += gaussians
                     total_vmf += vmf
 
@@ -408,8 +408,10 @@ def isotropic_ndf_filtering(si: mi.SurfaceInteraction3f):
     mask = si.is_valid()
 
     # alpha_u and alpha_v are anisotropic roughness parameters
-    alpha_u = si.bsdf().eval_attribute_1("alpha_u", si).torch()
-    alpha_v = si.bsdf().eval_attribute_1("alpha_v", si).torch()
+    # TODO: need to handle cases when bsdf has only alpha or alpha_u/alpha_v
+    alpha_u = si.bsdf().eval_attribute_1("alpha", si).torch()
+    alpha_v = si.bsdf().eval_attribute_1("alpha", si).torch()
+    print_tensor_stats(alpha_u.unsqueeze(-1), "alpha")
     # if torch.all(alpha_u == 0) and torch.all(alpha_v == 0):
     #     alpha = si.bsdf().eval_attribute_1("alpha", si).torch()
     #     alpha_u = alpha
@@ -680,6 +682,7 @@ class vapl_mixture:
         wo = mi.Vector3f(wo_world.permute(1, 0))
         wi = si.sh_frame.to_local(mi.Vector3f(wi_world.permute(1, 0)))
         wi_tensor = wi.torch().permute(1, 0)
+        wo_ts = si.sh_frame.to_local(mi.Vector3f(wo_world.permute(1, 0)))
 
         # bsdf at the current intersection
         bsdf: mi.BSDFPtr = si.bsdf()
@@ -706,6 +709,7 @@ class vapl_mixture:
         ctx_diffuse = mi.BSDFContext()
         ctx_diffuse.type_mask = mi.BSDFFlags.Diffuse
         diffuse : mi.Color3f = bsdf.eval(ctx_diffuse, si, wo)
+        diffuse_eval = bsdf.eval_diffuse_reflectance(si)
 
         # Diffuse SG lighting.
 		# [Tokuyoshi et al. 2024 "Hierarchical Light Sampling with Accurate Spherical Gaussian Lighting", Section 4]
@@ -714,7 +718,10 @@ class vapl_mixture:
 
         diffuse_illumination = amplitude * sg_clamp_cosine_product_integral_over_pi(cosine, self.light_lobe_sharpness)
         diffuse_tensor : torch.Tensor  = diffuse.torch().permute(1, 0)
-        diffuse_illumination_result = diffuse_tensor * diffuse_illumination
+        print_tensor_stats(diffuse_tensor)
+        diffuse_tensor_eval : torch.Tensor  = diffuse_eval.torch().permute(1, 0)
+        print_tensor_stats(diffuse_tensor_eval)
+        diffuse_illumination_result = diffuse_tensor_eval * diffuse_illumination
 
         # Compute JJ^T for NDF filtering.
         mask = wi_tensor[:, 2] == 0
@@ -828,6 +835,26 @@ class vapl_mixture:
         ctx_specular.type_mask = mi.BSDFFlags.Glossy
         specular : mi.Spectrum = bsdf.eval(ctx_specular, si, wo)
         specular_tensor : torch.Tensor = specular.torch().permute(1, 0)
+        print_tensor_stats(specular_tensor, "bsdf specular")
+
+        # TODO: figure out how to handle all this specular bsdf stuff
+        specular_reflectance = bsdf.eval_attribute_3("specular_reflectance", si).torch().permute(1, 0)
+        non_zero_mask = specular_reflectance.norm(dim=1) != 0
+        k = bsdf.eval_attribute_3("k", si).torch().permute(1, 0)
+        print_tensor_stats(k, "k")
+        eta = bsdf.eval_attribute_3("eta", si).torch().permute(1, 0)
+        print_tensor_stats(eta, "eta")
+        cos_theta_i = torch.sum(wi_tensor * norm_tensor, dim=-1, keepdim=True)
+        print_tensor_stats(cos_theta_i, "cos")
+        n2_plus_k2 = eta**2 + k**2
+        two_n_cos_theta = 2 * eta * cos_theta_i
+        cos_theta2 = cos_theta_i**2
+        numerator = n2_plus_k2 - two_n_cos_theta + cos_theta2
+        denominator = n2_plus_k2 + two_n_cos_theta + cos_theta2
+        fresnel_reflectance = numerator / denominator
+        print_tensor_stats(fresnel_reflectance, "fresnel")
+        specular_tensor = fresnel_reflectance
+        specular_tensor[non_zero_mask] = specular_reflectance[non_zero_mask] * fresnel_reflectance[non_zero_mask]
         print_tensor_stats(specular_tensor, "bsdf specular")
 
         specular_illumination = amplitude * visibility * lobe * sg_int
@@ -1276,3 +1303,9 @@ encoders = {
     "min-max-norm": minmaxnorm,
     "raw": lambda x: x,
 }
+
+def weighted_loss(real, predicted, weight):
+    eps = 0.01
+    mse = (real - predicted) ** 2
+    norm_factor = (weight * (predicted ** 2).detach() + eps)
+    return (mse / norm_factor).mean()
