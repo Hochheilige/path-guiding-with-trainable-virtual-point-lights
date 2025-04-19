@@ -35,6 +35,7 @@ encoders = {
     "relu": torch.relu,
     "sigmoid": torch.sigmoid,
     "relu": torch.relu,
+    "tanh" : torch.tanh,
     "softplus": F.softplus,
     "normalize": F.normalize,
     "spherical": spherical,

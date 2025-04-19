@@ -33,15 +33,16 @@ class Application:
         self.loss_function = Loss(weighted_loss)
         self.integrator = RHSIntegrator(self.grid, self.loss_function)
 
-        if config.mode == "wandb" or config.mode == "sweep":
+        if config.mode == "wandb":
             wandb.login()
 
-        image = mi.render(self.scene, spp=128)
-        fig, ax = plt.subplots()
-        ax.imshow(np.clip(image ** (1.0 / 2.2), 0, 1))
-        ax.axis("off")
-        ax.set_title(f"Path-traced image")
-        plt.show()
+        if config.mode != "sweep":
+            image = mi.render(self.scene, spp=128)
+            fig, ax = plt.subplots()
+            ax.imshow(np.clip(image ** (1.0 / 2.2), 0, 1))
+            ax.axis("off")
+            ax.set_title(f"Path-traced image")
+            plt.show()
 
     def train(self):
         if self.config.mode == "wandb":
@@ -50,6 +51,8 @@ class Application:
                 name=self.config.run_name,
                 config=self.config
             )
+        elif self.config.mode == "sweep":
+            wandb.init(project="vapls-parameters-encodings-search")
 
         for epoch in range(self.config.epoch):
             self.integrator.epoch = epoch
