@@ -74,8 +74,6 @@ class vapl_grid_base(torch.nn.Module):
         self.vmf_grid = tcnn.Encoding(n_input_dims, grid_config["encoding"])
 
         self.learning_rate = config.optimizer.learning_rate
-        if (config.mode == "sweep"):
-            self.learning_rate = config.sweep_config.learning_rate
 
     @classmethod
     def create_vapl_grid(cls, config , bb_min, bb_max):

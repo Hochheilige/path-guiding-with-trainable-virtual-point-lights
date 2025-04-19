@@ -44,6 +44,12 @@ class Application:
             ax.set_title(f"Path-traced image")
             plt.show()
 
+    def sweep(self):
+        if self.config.mode == "sweep":
+            wandb.init(project="vapls-parameters-encodings-search")
+            self.config.sweep_config = wandb.config
+            self.train()
+        
     def train(self):
         if self.config.mode == "wandb":
             wandb.init(
@@ -51,8 +57,6 @@ class Application:
                 name=self.config.run_name,
                 config=self.config
             )
-        elif self.config.mode == "sweep":
-            wandb.init(project="vapls-parameters-encodings-search")
 
         for epoch in range(self.config.epoch):
             self.integrator.epoch = epoch
