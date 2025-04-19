@@ -1,3 +1,5 @@
+import mitsuba as mi
+mi.set_variant("cuda_ad_rgb")
 import numpy as np
 import matplotlib.pyplot as plt
 import wandb
@@ -34,6 +36,13 @@ class Application:
         if config.mode == "wandb" or config.mode == "sweep":
             wandb.login()
 
+        image = mi.render(self.scene, spp=128)
+        fig, ax = plt.subplots()
+        ax.imshow(np.clip(image ** (1.0 / 2.2), 0, 1))
+        ax.axis("off")
+        ax.set_title(f"Path-traced image")
+        plt.show()
+
     def train(self):
         if self.config.mode == "wandb":
             wandb.init(
@@ -42,7 +51,7 @@ class Application:
                 config=self.config
             )
 
-        for epoch in self.config.epoch:
+        for epoch in range(self.config.epoch):
             self.integrator.epoch = epoch
             image = mi.render(self.scene, spp=self.config.spp, integrator=self.integrator)
             if self.config.mode != "sweep":
@@ -99,7 +108,7 @@ class Application:
         means_ndc = world_to_ndc(scene, p)  
         means_pix = ndc_to_pixel(means_ndc, h, w)
     
-        amplitude_norm = amplitude / amplitude.max() if amplitude.max() > 0 else amplitude
+        amplitude_norm = amplitude / amplitude.max() if amplitude.max() != 0 else amplitude
         colors = amplitude_norm
     
         point_sizes = 10 * variance
@@ -110,5 +119,6 @@ class Application:
         dx = axis_pix.x - means_pix.x
         dy = axis_pix.y - means_pix.y
     
-        ax.scatter(means_pix.x, means_pix.y, c=colors, marker='o', s=point_sizes)
-        ax.quiver(means_pix.x, means_pix.y, dx, dy, angles='uv', color=colors, scale=1, scale_units='xy')
+        ax.scatter(means_pix.x, means_pix.y, c=colors, cmap='coolwarm', marker='o', s=point_sizes)
+        # TODO: figure out how to render arrows more correct
+        #ax.quiver(means_pix.x, means_pix.y, dx, dy, angles='uv', color=colors, scale=1, scale_units='xy')

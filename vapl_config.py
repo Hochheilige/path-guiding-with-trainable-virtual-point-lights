@@ -1,6 +1,10 @@
 class Config(dict):
     def __init__(self, config):
         super(Config, self).__init__(config)
+        for key, value in config.items():
+            if isinstance(value, dict):
+                value = Config(value)
+            self[key] = value
         self.__dict__ = self 
 
 raw_config = {
@@ -9,15 +13,15 @@ raw_config = {
     "sweep_config" : None,       # add to use sweep
     "run_name"     : None,       # for wandb runs
     "grid" : {
-        "type" :                      "regular",   # regular, mlp
+        "layout" :                    "regular",   # regular, mlp
         "resolution" :                 16,       
         "num_gaussians_in_mixture" :   1,
         "interpolation" :             "Nearest",   # [Nearest, Linear, Smooth]
         "gaussian_mean_encoding":     "raw",       # [raw, eps-norm, min-max-norm]
-        "gaussian_variance_encoding": "exp",       # [exp, sigmoid, softplus]
-        "vmf_sharpness_encoding":     "exp",       # [exp, relu, sigmoid, softplus]
+        "gaussian_variance_encoding": "softplus",  # [exp, sigmoid, softplus]
+        "vmf_sharpness_encoding":     "softplus",  # [exp, relu, sigmoid, softplus]
         "vmf_axis_encoding":          "normalize", # [raw, normalize, spherical, spherical-norm]
-        "vmf_amplitude_encoding":     "relu",      # [relu, softplus, exp]
+        "vmf_amplitude_encoding":     "exp",       # [relu, softplus, exp]
         "accumulate_gaussians" :       True,
     }, 
     # It is also possible to pass optimizer type here

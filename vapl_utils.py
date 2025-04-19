@@ -532,7 +532,7 @@ class vapl_mixture:
         print_tensor_stats(diffuse_tensor)
         diffuse_tensor_eval : torch.Tensor  = diffuse_eval.torch().permute(1, 0)
         print_tensor_stats(diffuse_tensor_eval)
-        diffuse_illumination_result = diffuse_tensor_eval * diffuse_illumination
+        diffuse_illumination_result = diffuse_tensor * diffuse_illumination
 
         # Compute JJ^T for NDF filtering.
         mask = wi_tensor[:, 2] == 0
@@ -651,21 +651,21 @@ class vapl_mixture:
         # TODO: figure out how to handle all this specular bsdf stuff
         specular_reflectance = bsdf.eval_attribute_3("specular_reflectance", si).torch().permute(1, 0)
         non_zero_mask = specular_reflectance.norm(dim=1) != 0
-        k = bsdf.eval_attribute_3("k", si).torch().permute(1, 0)
-        print_tensor_stats(k, "k")
-        eta = bsdf.eval_attribute_3("eta", si).torch().permute(1, 0)
-        print_tensor_stats(eta, "eta")
-        cos_theta_i = torch.sum(wi_tensor * norm_tensor, dim=-1, keepdim=True)
-        print_tensor_stats(cos_theta_i, "cos")
-        n2_plus_k2 = eta**2 + k**2
-        two_n_cos_theta = 2 * eta * cos_theta_i
-        cos_theta2 = cos_theta_i**2
-        numerator = n2_plus_k2 - two_n_cos_theta + cos_theta2
-        denominator = n2_plus_k2 + two_n_cos_theta + cos_theta2
-        fresnel_reflectance = numerator / denominator
-        print_tensor_stats(fresnel_reflectance, "fresnel")
-        specular_tensor = fresnel_reflectance
-        specular_tensor[non_zero_mask] = specular_reflectance[non_zero_mask] * fresnel_reflectance[non_zero_mask]
+        # k = bsdf.eval_attribute_3("k", si).torch().permute(1, 0)
+        # print_tensor_stats(k, "k")
+        # eta = bsdf.eval_attribute_3("eta", si).torch().permute(1, 0)
+        # print_tensor_stats(eta, "eta")
+        # cos_theta_i = torch.sum(wi_tensor * norm_tensor, dim=-1, keepdim=True)
+        # print_tensor_stats(cos_theta_i, "cos")
+        # n2_plus_k2 = eta**2 + k**2
+        # two_n_cos_theta = 2 * eta * cos_theta_i
+        # cos_theta2 = cos_theta_i**2
+        # numerator = n2_plus_k2 - two_n_cos_theta + cos_theta2
+        # denominator = n2_plus_k2 + two_n_cos_theta + cos_theta2
+        # fresnel_reflectance = numerator / denominator
+        # print_tensor_stats(fresnel_reflectance, "fresnel")
+        #specular_tensor = fresnel_reflectance
+        #specular_tensor[non_zero_mask] = specular_reflectance[non_zero_mask] # * fresnel_reflectance[non_zero_mask]
         print_tensor_stats(specular_tensor, "bsdf specular")
 
         specular_illumination = amplitude * visibility * lobe * sg_int
