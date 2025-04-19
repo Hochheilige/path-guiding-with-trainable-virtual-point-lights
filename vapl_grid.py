@@ -7,6 +7,9 @@ import torch.nn.functional as F
 import tinycudann as tcnn
 torch.autograd.set_detect_anomaly(True)
 
+import numpy as np
+import matplotlib.pyplot as plt
+
 def minmaxnorm(x):
     return (x - x.min()) / (x.max() - x.min())
 
@@ -76,9 +79,9 @@ class vapl_grid_base(torch.nn.Module):
     @classmethod
     def create_vapl_grid(config, bb_min, bb_max):
         if config.grid.type == "mlp":
-            return vapl_grid_mlp(config, bb_min, bb_max)
+            return vapl_grid_mlp(config, bb_min, bb_max).cuda()
         else:
-            return vapl_grid(config, bb_min, bb_max)
+            return vapl_grid(config, bb_min, bb_max).cuda()
         
     def sample_vpls(self, pos):
         block_size = 1.0 / self.config.grid.resolution
@@ -170,6 +173,19 @@ class vapl_grid_base(torch.nn.Module):
             vmf : torch.Tensor = self.vmf_grid(X).to(dtype=torch.float32)
 
         return gaussians, vmf
+    
+    def get_gaussians_for_debug_render(self):
+        with torch.no_grad():
+            resolution = self.config.resolution / 2
+            device = "cuda"
+
+            lin = torch.linspace(0, 1, resolution, device=device)
+            X, Y, Z = torch.meshgrid(lin, lin, lin, indexing='ij')
+
+            grid_points = torch.stack([X.flatten(), Y.flatten(), Z.flatten()], dim=-1)
+            world_positions : torch.Tensor = grid_points * (self.bb_max - self.bb_min) + self.bb_min
+
+            return self.get_vapls(world_positions)
         
 class vapl_grid(vapl_grid_base):
     def __init__(self, config, bb_min, bb_max):
@@ -218,5 +234,66 @@ class vapl_grid_mlp(vapl_grid_base):
 
         gaussians = outputs[:, :4]
         vmf = outputs[4:11]
-        
+
         return self.encode(gaussians, vmf)
+    
+
+# helper functions for debug vapl visualization
+def world_to_ndc(scene, batch):
+    """Transforms 3D world coordinates into normalized device coordinates (NDC) using the perspective transformation matrix.
+
+    Args:
+        scene (mi.Scene): Mitsuba 3 scene containing the camera information.
+        batch (array_like): Array of 3D world coordinates.
+
+    Returns:
+        mi.Point3f: Array of 3D points in NDC.
+    """
+    sensor = mi.traverse(scene.sensors()[0])
+    fov = sensor['x_fov']
+    near = sensor['near_clip']
+    far = sensor['far_clip']
+
+    trafo = mi.Transform4f().perspective(fov, near, far)
+    pts = trafo @ sensor['to_world'].inverse() @ mi.Point3f(np.array(batch.T))
+    return pts
+
+def ndc_to_pixel(pts, h, w):
+    """Converts points in NDC to pixel coordinates.
+
+    Args:
+        pts (mi.Point2f): Points in NDC.
+        h (float): Height of the image in pixels.
+        w (float): Width of the image in pixels.
+
+    Returns:
+        mi.Point2f: Pixel coordinates of the given points.
+    """
+    hh, hw = h/2, w/2
+    return mi.Point2f(dr.fma(pts.x, -hw, hw), dr.fma(pts.y, -hw, hh))  # not typo
+
+def draw_multi_segments(starts, ends, color):
+    """Draws multiple line segments on a plot.
+
+    Args:
+        starts (mi.Point2f): Starting points of the line segments.
+        ends (mi.Point2f): Ending points of the line segments.
+        color (str): Color of the line segments.
+    """
+    a = np.c_[starts.x, starts.y]
+    b = np.c_[ends.x, ends.y]
+    plt.plot(*np.c_[a, b, a*np.nan].reshape(-1, 2).T, color)
+
+def pix_coord(scene, batch, h, w):
+    """Calculates the pixel coordinates of the given 3D world coordinates.
+
+    Args:
+        scene (mi.Scene): Mitsuba 3 scene containing the camera information.
+        batch (array_like): Array of 3D world coordinates.
+        h (float): Height of the image in pixels.
+        w (float): Width of the image in pixels.
+
+    Returns:
+        mi.Point2f: Pixel coordinates of the given 3D world coordinates.
+    """
+    return ndc_to_pixel(world_to_ndc(scene, batch), h, w)

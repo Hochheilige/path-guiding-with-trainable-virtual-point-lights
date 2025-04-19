@@ -145,6 +145,12 @@ class Loss():
         elif self.num_params == 3:
             result = self.loss_fn(pred, target, weight)
         return result
+    
+def weighted_loss(real, predicted, weight):
+    eps = 0.01
+    mse = (real - predicted) ** 2
+    norm_factor = (weight * (predicted ** 2).detach() + eps)
+    return (mse / norm_factor).mean()
 
 class RHSIntegrator(ADIntegrator):
     def __init__(self, model, loss_function : Loss,  props=mi.Properties()):

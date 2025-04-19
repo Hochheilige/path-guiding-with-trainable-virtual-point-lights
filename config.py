@@ -7,6 +7,7 @@ raw_config = {
     "scene"     : "cornell box", # cornell box, veach mis
     "mode"      : "local",       # local, wandb, sweep
     "sweep_config" : None,       # add to use sweep
+    "run_name"     : None,       # for wandb runs
     "grid" : {
         "type" :                      "regular",   # regular, mlp
         "resolution" :                 16,       
@@ -25,6 +26,8 @@ raw_config = {
         "learning_rate" :  0.001,
         "regularization" : False,
     },
+    "epoch" : 1000,
+    "spp" : 1
 }
 
 config = Config(raw_config)
