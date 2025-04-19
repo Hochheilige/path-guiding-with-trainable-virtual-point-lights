@@ -11,14 +11,16 @@ raw_config = {
         "type" :                      "regular",   # regular, mlp
         "resolution" :                 16,       
         "num_gaussians_in_mixture" :   1,
-        "interpolation" :             "Nearest",   # Nearest, Linear, Smooth
-        "gaussian_mean_encoding":     "raw",       # raw, eps-norm, "min-max-norm"
-        "gaussian_variance_encoding": "exp",       # exp, sigmoid, softplus
-        "vmf_sharpness_encoding":     "exp",       # exp, relu, sigmoid, softplus
-        "vmf_axis_encoding":          "normalize", # raw, normalize, spherical, spherical-norm
-        "vmf_amplitude_encoding":     "relu",      # relu, softplus, exp
+        "interpolation" :             "Nearest",   # [Nearest, Linear, Smooth]
+        "gaussian_mean_encoding":     "raw",       # [raw, eps-norm, min-max-norm]
+        "gaussian_variance_encoding": "exp",       # [exp, sigmoid, softplus]
+        "vmf_sharpness_encoding":     "exp",       # [exp, relu, sigmoid, softplus]
+        "vmf_axis_encoding":          "normalize", # [raw, normalize, spherical, spherical-norm]
+        "vmf_amplitude_encoding":     "relu",      # [relu, softplus, exp]
         "accumulate_gaussians" :       True,
     }, 
+    # It is also possible to pass optimizer type here
+    # but right now I don't see the reason to do that
     "optimizer" : {
         "learning_rate" :  0.001,
         "regularization" : False,

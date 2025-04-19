@@ -1078,43 +1078,6 @@ def print_tensor_stats(tensor, tensor_name="tensor"):
         else:
             print("Input is not a valid torch tensor.")
 
-import torch.nn.functional as F
-
-def minmaxnorm(x):
-    return (x - x.min()) / (x.max() - x.min())
-
-def eps_norm(x):
-    eps = 1e-2
-    return x / eps * 0.5 - 0.5
-
-def spherical(x):
-    theta = torch.sigmoid(x[:, 0])
-    phi   = torch.sigmoid(x[:, 1])
-    axis = torch.stack([
-             torch.sin(theta) * torch.cos(phi),
-             torch.sin(theta) * torch.sin(phi),
-             torch.cos(theta)]).permute(1, 0)
-    return axis
-
-
-def spherical_norm(x):
-    return F.normalize(spherical(x))
-
-encoders = {
-    "log": torch.log,
-    "exp": torch.exp,
-    "relu": torch.relu,
-    "sigmoid": torch.sigmoid,
-    "relu": torch.relu,
-    "softplus": F.softplus,
-    "normalize": F.normalize,
-    "spherical": spherical,
-    "spherical-norm": spherical_norm,
-    "eps-norm" : eps_norm,
-    "min-max-norm": minmaxnorm,
-    "raw": lambda x: x,
-}
-
 def weighted_loss(real, predicted, weight):
     eps = 0.01
     mse = (real - predicted) ** 2
