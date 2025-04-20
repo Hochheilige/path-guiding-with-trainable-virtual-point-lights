@@ -37,6 +37,7 @@ class Application:
             wandb.login()
 
         if config.mode != "sweep":
+            self.epoch = self.config.epoch
             image = mi.render(self.scene, spp=128)
             fig, ax = plt.subplots()
             ax.imshow(np.clip(image ** (1.0 / 2.2), 0, 1))
@@ -48,6 +49,7 @@ class Application:
         if self.config.mode == "sweep":
             wandb.init(project="vapls-parameters-encodings-search")
             self.config.sweep_config = wandb.config
+            self.epoch = self.config.sweep_config.epoch
             self.train()
 
     def train(self):
@@ -58,7 +60,7 @@ class Application:
                 config=self.config
             )
 
-        for epoch in range(self.config.epoch):
+        for epoch in range(self.epoch):
             self.integrator.epoch = epoch
             image = mi.render(self.scene, spp=self.config.spp, integrator=self.integrator)
             self.render(epoch, image)
