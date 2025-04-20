@@ -233,18 +233,20 @@ def isotropic_ndf_filtering(si: mi.SurfaceInteraction3f):
 
     if dr.any(alpha_mask):
         alpha_val = bsdf.eval_attribute_1("alpha", si, active=alpha_mask)
-        dr.select(alpha_mask, alpha_val, alpha_u)
-        dr.select(alpha_mask, alpha_val, alpha_v)
+        alpha_u = dr.select(alpha_mask, alpha_val, alpha_u)
+        alpha_v = dr.select(alpha_mask, alpha_val, alpha_v)
 
     if dr.any(alpha_uv_mask):
         alpha_u_val = bsdf.eval_attribute_1("alpha_u", si, active=alpha_uv_mask)
         alpha_v_val = bsdf.eval_attribute_1("alpha_v", si, active=alpha_uv_mask)
-        dr.select(alpha_uv_mask, alpha_u_val, alpha_u)
-        dr.select(alpha_uv_mask, alpha_v_val, alpha_v)
+        alpha_u = dr.select(alpha_uv_mask, alpha_u_val, alpha_u)
+        alpha_v = dr.select(alpha_uv_mask, alpha_v_val, alpha_v)
  
     alpha_u = alpha_u.torch()
     alpha_v = alpha_v.torch()
 
+    print_tensor_stats(alpha_u.unsqueeze(-1), "alphau")
+    print_tensor_stats(alpha_v.unsqueeze(-1), "alphav")
     # [N, 1] kernel roughness from Eq.14
     kernel_roughness2 = SIGMA2 * (torch.sum(dndu * dndu, dim=-1) + torch.sum(dndv * dndv, dim=-1))  # [N]
     clamped_kernel_roughness2 = torch.clamp(kernel_roughness2, max=KAPPA).unsqueeze(-1)  # [N, 1]
@@ -655,32 +657,13 @@ class vapl_mixture:
         # Create Glossy BSDF context
         ctx_specular = mi.BSDFContext()
         ctx_specular.type_mask = mi.BSDFFlags.Glossy
-        specular : mi.Spectrum = bsdf.eval(ctx_specular, si, wo)
+        specular : mi.Spectrum = bsdf.eval(ctx_specular, si, wo_ts)
         specular_tensor : torch.Tensor = specular.torch().permute(1, 0)
-        print_tensor_stats(specular_tensor, "bsdf specular")
-
-        # TODO: figure out how to handle all this specular bsdf stuff
-        specular_reflectance = bsdf.eval_attribute_3("specular_reflectance", si).torch().permute(1, 0)
-        non_zero_mask = specular_reflectance.norm(dim=1) != 0
-        # k = bsdf.eval_attribute_3("k", si).torch().permute(1, 0)
-        # print_tensor_stats(k, "k")
-        # eta = bsdf.eval_attribute_3("eta", si).torch().permute(1, 0)
-        # print_tensor_stats(eta, "eta")
-        # cos_theta_i = torch.sum(wi_tensor * norm_tensor, dim=-1, keepdim=True)
-        # print_tensor_stats(cos_theta_i, "cos")
-        # n2_plus_k2 = eta**2 + k**2
-        # two_n_cos_theta = 2 * eta * cos_theta_i
-        # cos_theta2 = cos_theta_i**2
-        # numerator = n2_plus_k2 - two_n_cos_theta + cos_theta2
-        # denominator = n2_plus_k2 + two_n_cos_theta + cos_theta2
-        # fresnel_reflectance = numerator / denominator
-        # print_tensor_stats(fresnel_reflectance, "fresnel")
-        #specular_tensor = fresnel_reflectance
-        #specular_tensor[non_zero_mask] = specular_reflectance[non_zero_mask] # * fresnel_reflectance[non_zero_mask]
-        print_tensor_stats(specular_tensor, "bsdf specular")
-
+        print_tensor_stats(specular_tensor, "bsdf glossy")
+        
         specular_illumination = amplitude * visibility * lobe * sg_int
         specular_illumination_result = specular_tensor * specular_illumination
+        print_tensor_stats(specular_illumination_result, "specular result")
         result = emissive * (diffuse_illumination_result + specular_illumination_result)
         print_tensor_stats(result, "result")
 
@@ -707,7 +690,7 @@ def compute_bsdf_weight(bsdf, bsdf_ctx, si, wo_new, active=True):
     return bsdf_weight
 
 def print_tensor_stats(tensor, tensor_name="tensor"):
-    return
+    #return
     # TODO: add asserts for wrong tensors
     with torch.no_grad():
         if isinstance(tensor, torch.Tensor):
