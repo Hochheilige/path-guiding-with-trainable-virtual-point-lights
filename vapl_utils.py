@@ -218,16 +218,32 @@ def isotropic_ndf_filtering(si: mi.SurfaceInteraction3f):
     dndv = si.dn_dv.torch().permute(1, 0)
     mask = si.is_valid()
 
-    # alpha_u and alpha_v are anisotropic roughness parameters
-    # TODO: need to handle cases when bsdf has only alpha or alpha_u/alpha_v
-    alpha_u = si.bsdf().eval_attribute_1("alpha", si).torch()
-    alpha_v = si.bsdf().eval_attribute_1("alpha", si).torch()
-    print_tensor_stats(alpha_u.unsqueeze(-1), "alpha")
-    # if torch.all(alpha_u == 0) and torch.all(alpha_v == 0):
-    #     alpha = si.bsdf().eval_attribute_1("alpha", si).torch()
-    #     alpha_u = alpha
-    #     alpha_v = alpha
+    bsdf = si.bsdf()
 
+    # alpha_u and alpha_v are anisotropic roughness parameters
+    has_alpha    = bsdf.has_attribute("alpha", active=True)
+    has_alpha_u  = bsdf.has_attribute("alpha_u", active=True)
+    has_alpha_v  = bsdf.has_attribute("alpha_v", active=True)
+
+    alpha_mask      = has_alpha & ~has_alpha_u & ~has_alpha_v
+    alpha_uv_mask   = has_alpha_u & has_alpha_v
+
+    alpha_u = dr.zeros(mi.Float, dr.shape(si.p)[1])
+    alpha_v = dr.zeros(mi.Float, dr.shape(si.p)[1])
+
+    if dr.any(alpha_mask):
+        alpha_val = bsdf.eval_attribute_1("alpha", si, active=alpha_mask)
+        dr.select(alpha_mask, alpha_val, alpha_u)
+        dr.select(alpha_mask, alpha_val, alpha_v)
+
+    if dr.any(alpha_uv_mask):
+        alpha_u_val = bsdf.eval_attribute_1("alpha_u", si, active=alpha_uv_mask)
+        alpha_v_val = bsdf.eval_attribute_1("alpha_v", si, active=alpha_uv_mask)
+        dr.select(alpha_uv_mask, alpha_u_val, alpha_u)
+        dr.select(alpha_uv_mask, alpha_v_val, alpha_v)
+ 
+    alpha_u = alpha_u.torch()
+    alpha_v = alpha_v.torch()
 
     # [N, 1] kernel roughness from Eq.14
     kernel_roughness2 = SIGMA2 * (torch.sum(dndu * dndu, dim=-1) + torch.sum(dndv * dndv, dim=-1))  # [N]
@@ -516,12 +532,10 @@ class vapl_mixture:
         self.light_lobe_axis, self.light_lobe_sharpness, self.light_lobe_log_amplitude = sg_product(
             self.axis, self.sharpness.unsqueeze(1), light_dir, light_sharpness)
 
-        # Create Diffuse BSDF context
-        ctx_diffuse = mi.BSDFContext()
-        ctx_diffuse.type_mask = mi.BSDFFlags.Diffuse
-        diffuse : mi.Color3f = bsdf.eval(ctx_diffuse, si, wo)
-        diffuse_eval = bsdf.eval_diffuse_reflectance(si)
-
+        # Get bsdf diffuse reflectance
+        # read from bsdf parameter if bsdf has it calculate otherwise
+        diffuse = bsdf.eval_diffuse_reflectance(si)
+        
         # Diffuse SG lighting.
 		# [Tokuyoshi et al. 2024 "Hierarchical Light Sampling with Accurate Spherical Gaussian Lighting", Section 4]
         amplitude = torch.exp(self.light_lobe_log_amplitude)
@@ -529,9 +543,6 @@ class vapl_mixture:
 
         diffuse_illumination = amplitude * sg_clamp_cosine_product_integral_over_pi(cosine, self.light_lobe_sharpness)
         diffuse_tensor : torch.Tensor  = diffuse.torch().permute(1, 0)
-        print_tensor_stats(diffuse_tensor)
-        diffuse_tensor_eval : torch.Tensor  = diffuse_eval.torch().permute(1, 0)
-        print_tensor_stats(diffuse_tensor_eval)
         diffuse_illumination_result = diffuse_tensor * diffuse_illumination
 
         # Compute JJ^T for NDF filtering.
