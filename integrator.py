@@ -153,11 +153,15 @@ def weighted_loss(real, predicted, weight):
     return (mse / norm_factor).mean()
 
 class RHSIntegrator(ADIntegrator):
-    def __init__(self, model, loss_function : Loss,  props=mi.Properties()):
+    def __init__(self, model, loss_function : Loss, train, props=mi.Properties()):
         super().__init__(props)
+        self.train = train
         self.model = model
         self.losses = []
         self.loss_function = loss_function
+
+    def set_train(self, train):
+        self.train = train
 
     # Basics for Path-tracing using trained vapls
     @dr.syntax
@@ -178,6 +182,7 @@ class RHSIntegrator(ADIntegrator):
         ray = mi.Ray3f(dr.detach(ray))
         max_depth = 4
         self.losses = []
+        si = None
 
         for depth in range(max_depth):
             #print("iteration: ", depth)
@@ -194,12 +199,13 @@ class RHSIntegrator(ADIntegrator):
             # get the vapl mixture for this intersection
             gaussians, vmfs = self.model(si)
             mixture = vapl_mixture(gaussians, vmfs)
-            mixture.sample_vapl(si)
+            mixture.sample_vapl(si, ray.d)
 
             # Calculating new sample direction
 
             # 1st option - Sample direction from sampled vapl light lobe
             sampled_dir : torch.Tensor = mixture.sample_from_current_ligth_lobe_vmf()
+            print(sampled_dir)
 
             # 2nd option - Sample direction according to BSDF x vapl convolution
             # Specular BSDF - Anisotropic Spherical Gaussian
@@ -216,21 +222,20 @@ class RHSIntegrator(ADIntegrator):
             new_dir = mi.cuda_ad_rgb.Vector3f(sampled_dir)
             ray = si.spawn_ray(new_dir)
 
-            L_tensor = torch.from_numpy(Li.numpy()).to("cuda").T
-            light_from_vapl = mixture.illumination
+            # L_tensor = torch.from_numpy(Li.numpy()).to("cuda").T
+            # light_from_vapl = mixture.illumination
 
-            mse_loss_func = torch.nn.MSELoss()
-            loss = mse_loss_func(light_from_vapl, L_tensor)
-            self.losses.append(loss.item())
-            loss.backward()
-            self.model.sg_optimizer.step()
-            self.model.vmf_optimizer.step()
-            self.model.sg_optimizer.zero_grad()
-            self.model.vmf_optimizer.zero_grad()
+            # mse_loss_func = torch.nn.MSELoss()
+            # loss = mse_loss_func(light_from_vapl, L_tensor)
+            # self.losses.append(loss.item())
+            # loss.backward()
+            # self.model.sg_optimizer.step()
+            # self.model.vmf_optimizer.step()
+            # self.model.sg_optimizer.zero_grad()
+            # self.model.vmf_optimizer.zero_grad()
 
             L += Li
-
-        torch.cuda.empty_cache()
+        return L, si
 
     def sample_training(self, scene: mi.Scene, sampler: mi.Sampler, ray: mi.Ray3f, depth: mi.UInt32):
         w, h = list(scene.sensors()[0].film().size())
@@ -288,15 +293,20 @@ class RHSIntegrator(ADIntegrator):
                state_in,
                active):
 
-        L, L_vapl, weight, si = self.sample_training(scene, sampler, ray, depth)
+        if self.train:
+            L, L_vapl, weight, si = self.sample_training(scene, sampler, ray, depth)
+    
+            L_tensor = torch.from_numpy(L.numpy()).to("cuda").T
+    
+            loss : torch.Tensor = self.loss_function(L_vapl, L_tensor, weight)
+            self.losses.append(loss.detach().cpu())
+            self.model.optimizer.zero_grad()
+            loss.backward()
+            self.model.optimizer.step()
+    
+            torch.cuda.empty_cache()
+            return L_vapl.permute(1, 0), si.is_valid(), [], mi.Spectrum(0)
+        else:
+            L, si = self.sample_using_vapls(mode, scene, sampler, ray, depth, δL, δaovs, state_in, active)
+            return L, si.is_valid(), [], mi.Spectrum(0)
 
-        L_tensor = torch.from_numpy(L.numpy()).to("cuda").T
-
-        loss : torch.Tensor = self.loss_function(L_vapl, L_tensor, weight)
-        self.losses.append(loss.detach().cpu())
-        self.model.optimizer.zero_grad()
-        loss.backward()
-        self.model.optimizer.step()
-
-        torch.cuda.empty_cache()
-        return L_vapl.permute(1, 0), si.is_valid(), [], mi.Spectrum(0)

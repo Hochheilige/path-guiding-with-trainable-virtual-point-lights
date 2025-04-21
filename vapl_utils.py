@@ -459,13 +459,13 @@ class vapl_mixture:
         self.normalized_vapl_weights = torch.ones(gaussians.shape[0])
         self.num_rays = gaussians.shape[0]
 
-    def calculate_normalized_vapl_weights(self, si : mi.SurfaceInteraction3f):
-        weights = self.convolve_with_bsdf(si)
+    def calculate_normalized_vapl_weights(self, si : mi.SurfaceInteraction3f, view_dir):
+        weights = self.convolve_with_bsdf(si, view_dir)
         total_weight = torch.sum(weights)
         self.normalized_vapl_weights = weights / total_weight
 
-    def sample_vapl(self, si : mi.SurfaceInteraction3f):
-        self.calculate_normalized_vapl_weights(si)
+    def sample_vapl(self, si : mi.SurfaceInteraction3f, view_dir):
+        self.calculate_normalized_vapl_weights(si, view_dir)
         indices = torch.multinomial(self.normalized_vapl_weights, num_samples=self.num_rays, replacement=True)
 
         self.mean                     = self.mean[indices]

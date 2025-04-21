@@ -31,7 +31,7 @@ class Application:
 
         self.grid = vapl_grid_base.create_vapl_grid(config, self.scene.bbox().min, self.scene.bbox().max)
         self.loss_function = Loss(weighted_loss)
-        self.integrator = RHSIntegrator(self.grid, self.loss_function)
+        self.integrator = RHSIntegrator(self.grid, self.loss_function, True)
 
         if config.mode == "wandb":
             wandb.login()
@@ -67,6 +67,20 @@ class Application:
 
         if self.config.mode == "wandb":
             wandb.finish()
+
+    def render_trained(self, spp):
+        self.integrator.set_train(False)
+        image = mi.render(self.scene, spp=spp, integrator=self.integrator)
+        fig, ax = plt.subplots(1, 2, figsize=(12, 6))
+        ax[0].imshow(np.clip(image ** (1.0 / 2.2), 0, 1))
+        ax[0].axis("off")
+        ax[0].set_title(f"Path-traced image with VAPL")
+
+        image = mi.render(self.scene, spp=spp)
+        ax[1].imshow(np.clip(image ** (1.0 / 2.2), 0, 1))
+        ax[1].axis("off")
+        ax[1].set_title(f"Path-traced image")
+        plt.show()
 
     def render(self, epoch, image):
         if (self.config.mode == "wandb" or self.config.mode == "sweep"):
