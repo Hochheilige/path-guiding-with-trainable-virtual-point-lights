@@ -690,7 +690,7 @@ def compute_bsdf_weight(bsdf, bsdf_ctx, si, wo_new, active=True):
     return bsdf_weight
 
 def print_tensor_stats(tensor, tensor_name="tensor"):
-    #return
+    return
     # TODO: add asserts for wrong tensors
     with torch.no_grad():
         if isinstance(tensor, torch.Tensor):

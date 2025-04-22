@@ -30,7 +30,7 @@ class Application:
             self.scene : mi.Scene = mi.load_file(config.scene)
 
         self.grid = vapl_grid_base.create_vapl_grid(config, self.scene.bbox().min, self.scene.bbox().max)
-        self.loss_function = Loss(weighted_loss)
+        self.loss_function = Loss(relativeL2)
         self.integrator = RHSIntegrator(self.grid, self.loss_function, True)
 
         if config.mode == "wandb":

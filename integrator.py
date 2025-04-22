@@ -152,6 +152,16 @@ def weighted_loss(real, predicted, weight):
     norm_factor = (weight * (predicted ** 2).detach() + eps)
     return (mse / norm_factor).mean()
 
+def relativeL2(ref, prediction, pdf):
+    eps = 1e-2
+    div = prediction.detach()
+    denominator = torch.mean(div, dim=1).view(-1,1)**2 +eps
+    
+    rL2 = (pdf*((prediction - ref))**2) / denominator
+    rL2 = rL2[~(torch.isinf(rL2) | torch.isnan(rL2))]
+    rL2 = rL2.mean()
+    return rL2
+
 class RHSIntegrator(ADIntegrator):
     def __init__(self, model, loss_function : Loss, train, props=mi.Properties()):
         super().__init__(props)
