@@ -536,7 +536,10 @@ class vapl_mixture:
 
         # Get bsdf diffuse reflectance
         # read from bsdf parameter if bsdf has it calculate otherwise
-        diffuse = bsdf.eval_diffuse_reflectance(si)
+        #diffuse = bsdf.eval_diffuse_reflectance(si)
+        ctx_diffuse = mi.BSDFContext()
+        ctx_diffuse.type_mask = mi.BSDFFlags.Diffuse
+        diffuse : mi.Spectrum = bsdf.eval(ctx_diffuse, si, wo_ts)
         
         # Diffuse SG lighting.
 		# [Tokuyoshi et al. 2024 "Hierarchical Light Sampling with Accurate Spherical Gaussian Lighting", Section 4]
