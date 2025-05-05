@@ -145,30 +145,31 @@ class Loss():
         elif self.num_params == 3:
             result = self.loss_fn(pred, target, weight)
         return result
-    
-def weighted_loss(real, predicted, weight):
+
+def weighted_loss(predicted, real, weight):
     eps = 0.01
     mse = (real - predicted) ** 2
     norm_factor = (weight * (predicted ** 2).detach() + eps)
     return (mse / norm_factor).mean()
 
-def relativeL2(ref, prediction, pdf):
+def relativeL2(prediction, ref, pdf):
     eps = 1e-2
     div = prediction.detach()
     denominator = torch.mean(div, dim=1).view(-1,1)**2 +eps
-    
+
     rL2 = (pdf*((prediction - ref))**2) / denominator
     rL2 = rL2[~(torch.isinf(rL2) | torch.isnan(rL2))]
     rL2 = rL2.mean()
     return rL2
 
 class RHSIntegrator(ADIntegrator):
-    def __init__(self, model, loss_function : Loss, train, props=mi.Properties()):
+    def __init__(self, model, loss_function : Loss, train, sweep_encoding = None, props=mi.Properties()):
         super().__init__(props)
         self.train = train
         self.model = model
         self.losses = []
         self.loss_function = loss_function
+        self.sweep_encoding = sweep_encoding
 
     def set_train(self, train):
         self.train = train
@@ -247,6 +248,9 @@ class RHSIntegrator(ADIntegrator):
             L += Li
         return L, si
 
+    def set_config(self, conf):
+        self.sweep_encoding = conf
+
     def sample_training(self, scene: mi.Scene, sampler: mi.Sampler, ray: mi.Ray3f, depth: mi.UInt32):
         w, h = list(scene.sensors()[0].film().size())
         L = mi.Spectrum(0)
@@ -263,8 +267,8 @@ class RHSIntegrator(ADIntegrator):
         si.compute_uv_partials(ray)
 
         gaussians, vmfs = self.model(si)
-        mixture = vapl_mixture(gaussians, vmfs)
-        mixture.convolve_with_bsdf(si, ray.d)
+        mixture = vapl_mixture(gaussians, vmfs, self.sweep_encoding)
+        mixture.convolve(si, ray.d)
 
         # update si and bsdf with the first non-specular ones
         si, β, _ = first_non_specular_or_null_si(scene, si, sampler, β)
@@ -305,15 +309,15 @@ class RHSIntegrator(ADIntegrator):
 
         if self.train:
             L, L_vapl, weight, si = self.sample_training(scene, sampler, ray, depth)
-    
+
             L_tensor = torch.from_numpy(L.numpy()).to("cuda").T
-    
+
             loss : torch.Tensor = self.loss_function(L_vapl, L_tensor, weight)
             self.losses.append(loss.detach().cpu())
             self.model.optimizer.zero_grad()
             loss.backward()
             self.model.optimizer.step()
-    
+
             torch.cuda.empty_cache()
             return L_vapl.permute(1, 0), si.is_valid(), [], mi.Spectrum(0)
         else:

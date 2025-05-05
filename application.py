@@ -25,47 +25,6 @@ class Application:
                    'alpha_v': 0.1
                },
             }
-            print(scene_dict)
-            scene_dict['back']['bsdf'] = {
-                'type': 'normalmap',
-                'normalmap': {
-                    'type': 'bitmap',
-                    'filename': 'normal_map.jpg'
-                },
-                'bsdf': {'type': 'ref', 'id': 'white'}
-
-            }
-            scene_dict['green-wall']['bsdf'] = {
-                'type': 'normalmap',
-                'normalmap': {
-                    'type': 'bitmap',
-                    'filename': 'normal_map.jpg'
-                },
-                'bsdf': {'type': 'ref', 'id': 'green'}
-
-            }
-            scene_dict['red-wall']['bsdf'] = {
-                'type': 'normalmap',
-                'normalmap': {
-                    'type': 'bitmap',
-                    'filename': 'normal_map.jpg'
-                },
-                'bsdf': {'type': 'ref', 'id': 'red'}
-
-            }
-
-            light = scene_dict['light']
-            radiance = light['emitter']['radiance']
-
-            # Убедимся, что это rgb-тип
-            if radiance['type'] == 'rgb':
-                old_value = radiance['value']
-                new_value = [v * 5 for v in old_value]
-                radiance['value'] = new_value
-                print(f"Интенсивность света увеличена: {old_value} -> {new_value}")
-            else:
-                print("error")
-
             self.scene : mi.Scene = mi.load_dict(scene_dict)
         else:
             self.scene : mi.Scene = mi.load_file(config.scene)
@@ -92,6 +51,7 @@ class Application:
             self.config.sweep_config = wandb.config
             self.epoch = self.config.sweep_config.epoch
             self.train()
+            self.integrator.set_config(self.sweep_config.vmf_axis_encoding)
 
     def train(self):
         if self.config.mode == "wandb":

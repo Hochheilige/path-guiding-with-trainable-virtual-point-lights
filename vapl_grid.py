@@ -52,7 +52,7 @@ class vapl_grid_base(torch.nn.Module):
         self.config = config
         self.bb_min = torch.tensor(bb_min, device="cuda")
         self.bb_max = torch.tensor(bb_max, device="cuda")
-       
+
         self.num_param_per_gaussian = 4
         self.num_param_per_vmf = 8
 
@@ -81,18 +81,18 @@ class vapl_grid_base(torch.nn.Module):
             return vapl_grid_mlp(config, bb_min, bb_max).cuda()
         else:
             return vapl_grid(config, bb_min, bb_max).cuda()
-        
+
     def sample_vpls(self, pos):
         block_size = 1.0 / self.config.grid.resolution
         normalized_pos = (pos - self.bb_min) / (self.bb_max - self.bb_min)
 
-        total_gaussians = self.gaussian_grid(normalized_pos).to(dtype=torch.float32)
-        total_vmf = self.vmf_grid(normalized_pos).to(dtype=torch.float32)
+        gaussians_list = [self.gaussian_grid(normalized_pos).to(dtype=torch.float32)]
+        vmf_list = [self.vmf_grid(normalized_pos).to(dtype=torch.float32)]
 
         for dx in [-1, 0, 1]:
             for dy in [-1, 0, 1]:
                 for dz in [-1, 0, 1]:
-                    if dx==0 and dy==0 and dz==0:
+                    if dx == 0 and dy == 0 and dz == 0:
                         continue
 
                     offset = torch.tensor([dx, dy, dz], device="cuda") * block_size
@@ -101,56 +101,81 @@ class vapl_grid_base(torch.nn.Module):
                     gaussians = self.gaussian_grid(neighbor_pos).to(dtype=torch.float32)
                     vmf = self.vmf_grid(neighbor_pos).to(dtype=torch.float32)
 
-                    total_gaussians = total_gaussians + gaussians
-                    total_vmf = total_vmf + vmf
+                    gaussians_list.append(gaussians)
+                    vmf_list.append(vmf)
 
-        return total_gaussians, total_vmf
-    
+        return gaussians_list, vmf_list
+
     def sweep_encoding(self, gaussians, vmf):
-        if (self.config.sweep_config.gaussian_mean_encoding == "raw"):
-            mean = encoders[self.config.sweep_config.gaussian_mean_encoding](gaussians[:, :3])
-        else:
-            mean = encoders[self.config.sweep_config.gaussian_mean_encoding](gaussians[:, :3])
-            mean = mean * (self.bb_max - self.bb_min) + self.bb_min
-        
-        variance = encoders[self.config.sweep_config.gaussian_variance_encoding](gaussians[:, 3]).unsqueeze(1)
-        sharpness = encoders[self.config.sweep_config.vmf_sharpness_encoding](vmf[:, 0]).unsqueeze(1)
+        def process_tensors(gaussians, vmf):
+            if (self.config.sweep_config.gaussian_mean_encoding == "raw"):
+                mean = encoders[self.config.sweep_config.gaussian_mean_encoding](gaussians[:, :3])
+            else:
+                mean = encoders[self.config.sweep_config.gaussian_mean_encoding](gaussians[:, :3])
+                mean = mean * (self.bb_max - self.bb_min) + self.bb_min
 
-        if (self.config.sweep_config.vmf_axis_encoding == "spherical" or
-            self.config.sweep_config.vmf_axis_encoding == "spherical-norm"):
-            axis = encoders[self.config.sweep_config.vmf_axis_encoding](vmf[:, 1:3])
-            amplitude = encoders[self.config.sweep_config.vmf_amplitude_encoding](vmf[:, 3:6])
-        else:
-            axis = encoders[self.config.sweep_config.vmf_axis_encoding](vmf[:, 1:4])
-            amplitude = encoders[self.config.sweep_config.vmf_amplitude_encoding](vmf[:, 4:7])
-                
-        gaussians = torch.cat([mean, variance], dim = 1)
-        vmf = torch.cat([sharpness, axis, amplitude], dim = 1)
+            variance = encoders[self.config.sweep_config.gaussian_variance_encoding](gaussians[:, 3]).unsqueeze(1)
+            sharpness = encoders[self.config.sweep_config.vmf_sharpness_encoding](vmf[:, 0]).unsqueeze(1)
 
-        return gaussians, vmf
-    
+            if (self.config.sweep_config.vmf_axis_encoding == "spherical" or
+                self.config.sweep_config.vmf_axis_encoding == "spherical-norm"):
+                axis = encoders[self.config.sweep_config.vmf_axis_encoding](vmf[:, 1:3])
+                amplitude = encoders[self.config.sweep_config.vmf_amplitude_encoding](vmf[:, 3:6])
+            else:
+                axis = encoders[self.config.sweep_config.vmf_axis_encoding](vmf[:, 1:4])
+                amplitude = encoders[self.config.sweep_config.vmf_amplitude_encoding](vmf[:, 4:7])
+
+            gaussians = torch.cat([mean, variance], dim = 1)
+            vmf = torch.cat([sharpness, axis, amplitude], dim = 1)
+
+            return gaussians, vmf
+
+        if isinstance(gaussians, list) and isinstance(vmf, list):
+            encoded_gaussians = []
+            encoded_vmf = []
+            for g, v in zip(gaussians, vmf):
+                e_gaussians, e_vmf = process_tensors(g, v)
+                encoded_gaussians.append(e_gaussians)
+                encoded_vmf.append(e_vmf)
+            return encoded_gaussians, encoded_vmf
+        else:
+            return process_tensors(gaussians, vmf)
+
+
     def encoding(self, gaussians, vmf):
-        if (self.config.grid.gaussian_mean_encoding == "raw"):
-            mean = encoders[self.config.grid.gaussian_mean_encoding](gaussians[:, :3])
+        def process_tensors(gaussians, vmf):
+            if self.config.grid.gaussian_mean_encoding == "raw":
+                mean = encoders[self.config.grid.gaussian_mean_encoding](gaussians[:, :3])
+            else:
+                mean = encoders[self.config.grid.gaussian_mean_encoding](gaussians[:, :3])
+                mean = mean * (self.bb_max - self.bb_min) + self.bb_min
+
+            variance = encoders[self.config.grid.gaussian_variance_encoding](gaussians[:, 3]).unsqueeze(1)
+            sharpness = encoders[self.config.grid.vmf_sharpness_encoding](vmf[:, 0]).unsqueeze(1)
+
+            if (self.config.grid.vmf_axis_encoding == "spherical" or
+                self.config.grid.vmf_axis_encoding == "spherical-norm"):
+                axis = encoders[self.config.grid.vmf_axis_encoding](vmf[:, 1:3])
+                amplitude = encoders[self.config.grid.vmf_amplitude_encoding](vmf[:, 3:6])
+            else:
+                axis = encoders[self.config.grid.vmf_axis_encoding](vmf[:, 1:4])
+                amplitude = encoders[self.config.grid.vmf_amplitude_encoding](vmf[:, 4:7])
+
+            gaussians = torch.cat([mean, variance], dim=1)
+            vmf = torch.cat([sharpness, axis, amplitude], dim=1)
+
+            return gaussians, vmf
+
+        if isinstance(gaussians, list) and isinstance(vmf, list):
+            encoded_gaussians = []
+            encoded_vmf = []
+            for g, v in zip(gaussians, vmf):
+                e_gaussians, e_vmf = process_tensors(g, v)
+                encoded_gaussians.append(e_gaussians)
+                encoded_vmf.append(e_vmf)
+            return encoded_gaussians, encoded_vmf
         else:
-            mean = encoders[self.config.grid.gaussian_mean_encoding](gaussians[:, :3])
-            mean = mean * (self.bb_max - self.bb_min) + self.bb_min
-        
-        variance = encoders[self.config.grid.gaussian_variance_encoding](gaussians[:, 3]).unsqueeze(1)
-        sharpness = encoders[self.config.grid.vmf_sharpness_encoding](vmf[:, 0]).unsqueeze(1)
-
-        if (self.config.grid.vmf_axis_encoding == "spherical" or
-            self.config.grid.vmf_axis_encoding == "spherical-norm"):
-            axis = encoders[self.config.grid.vmf_axis_encoding](vmf[:, 1:3])
-            amplitude = encoders[self.config.grid.vmf_amplitude_encoding](vmf[:, 3:6])
-        else:
-            axis = encoders[self.config.grid.vmf_axis_encoding](vmf[:, 1:4])
-            amplitude = encoders[self.config.grid.vmf_amplitude_encoding](vmf[:, 4:7])
-
-        gaussians = torch.cat([mean, variance], dim = 1)
-        vmf = torch.cat([sharpness, axis, amplitude], dim = 1)
-
-        return gaussians, vmf
+            return process_tensors(gaussians, vmf)
 
     def encode(self, gaussians, vmf):
         if self.config.mode == "sweep":
@@ -171,11 +196,11 @@ class vapl_grid_base(torch.nn.Module):
             gaussians : torch.Tensor = self.gaussian_grid(X).to(dtype=torch.float32)
             vmf : torch.Tensor = self.vmf_grid(X).to(dtype=torch.float32)
 
-        return gaussians, vmf
-    
+        return list(gaussians.split(4, dim=1)), list(vmf.split(8, dim=1))
+
     def get_gaussians_for_debug_render(self):
         with torch.no_grad():
-            resolution = int(self.config.grid.resolution / 8) # FIXME hack hack
+            resolution = int(self.config.grid.resolution / 4) # FIXME hack hack
             device = "cuda"
 
             lin = torch.linspace(0, 1, resolution, device=device)
@@ -183,11 +208,11 @@ class vapl_grid_base(torch.nn.Module):
 
             grid_points = torch.stack([X.flatten(), Y.flatten(), Z.flatten()], dim=-1)
             world_positions : torch.Tensor = grid_points * (self.bb_max - self.bb_min) + self.bb_min
-            
+
             gaussians : torch.Tensor = self.gaussian_grid(world_positions).to(dtype=torch.float32)
             vmf : torch.Tensor = self.vmf_grid(world_positions).to(dtype=torch.float32)
             return self.encode(gaussians, vmf)
-        
+
 class vapl_grid(vapl_grid_base):
     def __init__(self, config, bb_min, bb_max):
         super().__init__(config, bb_min, bb_max)
@@ -202,8 +227,8 @@ class vapl_grid(vapl_grid_base):
 
     def forward(self, input):
         gaussians, vmf = self.get_vapls(input)
-        return self.encode(gaussians, vmf)                
-        
+        return self.encode(gaussians, vmf)
+
 class vapl_grid_mlp(vapl_grid_base):
     def __init__(self, config, bb_min, bb_max):
         super().__init__(config, bb_min, bb_max)
@@ -237,7 +262,7 @@ class vapl_grid_mlp(vapl_grid_base):
         vmf = outputs[:, 4:11]
 
         return self.encode(gaussians, vmf)
-    
+
 
 # helper functions for debug vapl visualization
 def world_to_ndc(scene, batch):

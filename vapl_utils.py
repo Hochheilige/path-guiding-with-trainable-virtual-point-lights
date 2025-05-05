@@ -241,7 +241,7 @@ def isotropic_ndf_filtering(si: mi.SurfaceInteraction3f):
         alpha_v_val = bsdf.eval_attribute_1("alpha_v", si, active=alpha_uv_mask)
         alpha_u = dr.select(alpha_uv_mask, alpha_u_val, alpha_u)
         alpha_v = dr.select(alpha_uv_mask, alpha_v_val, alpha_v)
- 
+
     alpha_u = alpha_u.torch()
     alpha_v = alpha_v.torch()
 
@@ -449,15 +449,29 @@ def approximate_bsdf_with_vmf(bsdf : mi.BSDFPtr, normal : torch.Tensor, view_dir
     return axis, sharpness, amplitude
 
 class vapl_mixture:
-    def __init__(self, gaussians : torch.Tensor, vmfs : torch.Tensor):
-        self.mean      : torch.Tensor = gaussians[:, :3]
-        self.variance  : torch.Tensor = gaussians[:, 3]
-        self.sharpness : torch.Tensor = vmfs[:, 0]
-        self.axis      : torch.Tensor = vmfs[:, 1:4]
-        self.amplitude : torch.Tensor = vmfs[:, 4:7]
+    def __init__(self, gaussians, vmfs, sweep_encoding):
+        if not isinstance(gaussians, list):
+            gaussians = [gaussians]
+        if not isinstance(vmfs, list):
+            vmfs = [vmfs]
 
-        self.normalized_vapl_weights = torch.ones(gaussians.shape[0])
-        self.num_rays = gaussians.shape[0]
+        self.mean = [g[:, :3] for g in gaussians]
+        self.variance = [g[:, 3] for g in gaussians]
+        self.sharpness = [v[:, 0] for v in vmfs]
+        # need to pass config here because axis not always 1:4 and amplitude not always 4:7
+        if sweep_encoding == "spherical" or sweep_encoding == "spherical-norm":
+            self.axis = [v[:, 1:3] for v in vmfs]
+            self.amplitude = [v[:, 3:6] for v in vmfs]
+        else:
+            self.axis = [v[:, 1:4] for v in vmfs]
+            self.amplitude = [v[:, 4:7] for v in vmfs]
+
+        self.normalized_vapl_weights = [torch.ones(g.shape[0]) for g in gaussians]
+        self.num_rays = [g.shape[0] for g in gaussians]
+
+        self.illumination = torch.zeros(gaussians[0].shape[0], 3, device=gaussians[0].device, dtype=gaussians[0].dtype)
+        self.diffuse_illumination = torch.zeros(gaussians[0].shape[0], 3, device=gaussians[0].device, dtype=gaussians[0].dtype)
+        self.specular_illumination = torch.zeros(gaussians[0].shape[0], 3, device=gaussians[0].device, dtype=gaussians[0].dtype)
 
     def calculate_normalized_vapl_weights(self, si : mi.SurfaceInteraction3f, view_dir):
         weights = self.convolve_with_bsdf(si, view_dir)
@@ -496,7 +510,11 @@ class vapl_mixture:
         sampled_dir : torch.Tensor = sample_vmf(axis, sharpness[:, :1])
         return sampled_dir.permute(1, 0)
 
-    def convolve_with_bsdf(self, si : mi.SurfaceInteraction3f, view_dir : mi.Vector3f):
+    def convolve(self, si: mi.SurfaceInteraction3f, view_dir: mi.Vector3f):
+        for i in range(len(self.mean)):
+            self.convolve_with_bsdf(i, si, view_dir)
+
+    def convolve_with_bsdf(self, index, si : mi.SurfaceInteraction3f, view_dir : mi.Vector3f):
         SGLIGHT_SHARPNESS_MAX = float.fromhex("0x1.0p41")
         eps = 1e-4
 
@@ -516,15 +534,15 @@ class vapl_mixture:
         # bsdf at the current intersection
         bsdf: mi.BSDFPtr = si.bsdf()
 
-        light_vec = self.mean - pos_tensor
+        light_vec = self.mean[index] - pos_tensor
         squared_distance = torch.sum(light_vec * light_vec, dim=1).unsqueeze(1)
         light_dir = light_vec * torch.rsqrt(squared_distance)
 
         # clamp variance for the numerical stability
-        variance = torch.maximum(self.variance.unsqueeze(1), squared_distance / SGLIGHT_SHARPNESS_MAX)
+        variance = torch.maximum(self.variance[index].unsqueeze(1), squared_distance / SGLIGHT_SHARPNESS_MAX)
 
         # compute the maximum emissive radiance of the vapl.
-        emissive = self.amplitude / (variance)
+        emissive = self.amplitude[index] / (variance)
 
         # compute vapl sharpness for a light distribution viewed from the shading point.
         light_sharpness = squared_distance / (variance)
@@ -532,7 +550,7 @@ class vapl_mixture:
         # light lobe given by the product of the light distribution viewed
         # from the shading point and the directional distribution of the vapl.
         self.light_lobe_axis, self.light_lobe_sharpness, self.light_lobe_log_amplitude = sg_product(
-            self.axis, self.sharpness.unsqueeze(1), light_dir, light_sharpness)
+            self.axis[index], self.sharpness[index].unsqueeze(1), light_dir, light_sharpness)
 
         # Get bsdf diffuse reflectance
         # read from bsdf parameter if bsdf has it calculate otherwise
@@ -540,7 +558,7 @@ class vapl_mixture:
         ctx_diffuse = mi.BSDFContext()
         ctx_diffuse.type_mask = mi.BSDFFlags.Diffuse
         diffuse : mi.Spectrum = bsdf.eval(ctx_diffuse, si, wo_ts)
-        
+
         # Diffuse SG lighting.
 		# [Tokuyoshi et al. 2024 "Hierarchical Light Sampling with Accurate Spherical Gaussian Lighting", Section 4]
         amplitude = torch.exp(self.light_lobe_log_amplitude)
@@ -663,7 +681,7 @@ class vapl_mixture:
         specular : mi.Spectrum = bsdf.eval(ctx_specular, si, wo_ts)
         specular_tensor : torch.Tensor = specular.torch().permute(1, 0)
         print_tensor_stats(specular_tensor, "bsdf glossy")
-        
+
         specular_illumination = amplitude * visibility * lobe * sg_int
         specular_illumination_result = specular_tensor * specular_illumination
         print_tensor_stats(specular_illumination_result, "specular result")
@@ -671,15 +689,13 @@ class vapl_mixture:
         print_tensor_stats(result, "result")
 
         # Store illumination to calculate Loss later
-        self.diffuse_illumination = diffuse_illumination_result
-        self.specular_illumination = specular_illumination_result
-        self.illumination = result
+        self.diffuse_illumination = self.diffuse_illumination + diffuse_illumination_result
+        self.specular_illumination = self.specular_illumination + specular_illumination_result
+        self.illumination = self.illumination + result
 
         # Calculate BSDF approximations with vMF
         #view_dir = torch.from_numpy(si.to_world(wo).numpy()).to("cuda").T # ? not sure
         #self.bsdf_axis, self.bsdf_sharpness, self.bsdf_amplitude = approximate_bsdf_with_vmf(bsdf, norm_tensor, view_dir, roughness2)
-
-        return luminance(result)
 
     # Integration functions
 
