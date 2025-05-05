@@ -66,6 +66,10 @@ class Application:
             image = mi.render(self.scene, spp=self.config.spp, integrator=self.integrator)
             self.render(epoch, image)
 
+            if epoch == 100:
+                self.config.grid.accumulate_gaussians = True
+                self.grid.set_config(self.config)
+
         if self.config.mode == "wandb":
             wandb.finish()
 

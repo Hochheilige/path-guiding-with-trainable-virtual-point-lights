@@ -22,7 +22,7 @@ raw_config = {
         "vmf_sharpness_encoding":     "softplus",  # [exp, relu, sigmoid, softplus]
         "vmf_axis_encoding":          "normalize", # [raw, normalize, spherical, spherical-norm]
         "vmf_amplitude_encoding":     "exp",       # [relu, softplus, exp]
-        "accumulate_gaussians" :       True,
+        "accumulate_gaussians" :       False,
     }, 
     # It is also possible to pass optimizer type here
     # but right now I don't see the reason to do that

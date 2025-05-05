@@ -82,6 +82,9 @@ class vapl_grid_base(torch.nn.Module):
         else:
             return vapl_grid(config, bb_min, bb_max).cuda()
 
+    def set_config(self, config):
+        self.config = config
+
     def sample_vpls(self, pos):
         block_size = 1.0 / self.config.grid.resolution
         normalized_pos = (pos - self.bb_min) / (self.bb_max - self.bb_min)
