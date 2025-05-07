@@ -203,7 +203,7 @@ class vapl_grid_base(torch.nn.Module):
 
     def get_gaussians_for_debug_render(self):
         with torch.no_grad():
-            resolution = int(self.config.grid.resolution / 4) # FIXME hack hack
+            resolution = int(self.config.grid.resolution) # FIXME hack hack
             device = "cuda"
 
             lin = torch.linspace(0, 1, resolution, device=device)
@@ -243,7 +243,7 @@ class vapl_grid_mlp(vapl_grid_base):
 
         for _ in range(3):
             layers.append(torch.nn.Linear(input_dim, hidden_dim))
-            layers.append(torch.nn.LeakyReLU(negative_slope=0.2)) # TODO: set it up properly
+            layers.append(torch.nn.LeakyReLU()) # TODO: set it up properly
             input_dim = hidden_dim
 
         layers.append(torch.nn.Linear(hidden_dim, output_dim))
@@ -257,14 +257,22 @@ class vapl_grid_mlp(vapl_grid_base):
         )
 
     def forward(self, input):
-        gaussians, vmf = self.get_vapls(input)
-        grid_output = torch.cat([gaussians, vmf], dim=1)
-        outputs = self.fc(grid_output)
+        gaussians_list, vmf_list = self.get_vapls(input)
 
-        gaussians = outputs[:, :4]
-        vmf = outputs[:, 4:11]
+        output_gaussians_list = []
+        output_vmf_list = []
 
-        return self.encode(gaussians, vmf)
+        for gauss, vmf in zip(gaussians_list, vmf_list):
+            combined_input = torch.cat([gauss, vmf], dim=1)
+            output = self.fc(combined_input)
+
+            gaussians_output = output[:, :4]
+            vmf_output = output[:, 4:11]
+
+            output_gaussians_list.append(gaussians_output)
+            output_vmf_list.append(vmf_output)
+
+        return self.encode(output_gaussians_list, output_vmf_list)
 
 
 # helper functions for debug vapl visualization
