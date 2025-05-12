@@ -3,6 +3,8 @@ mi.set_variant("cuda_ad_rgb")
 import numpy as np
 import matplotlib.pyplot as plt
 import wandb
+import imageio
+from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 
 from integrator import *
 from vapl_grid import *
@@ -48,6 +50,9 @@ class Application:
             ax.set_title(f"Path-traced image")
             plt.show()
 
+        self.render_frames = []
+        self.render_frames_debug = []
+
     def sweep(self):
         if self.config.mode == "sweep":
             wandb.init(project="vapls-parameters-encodings-search")
@@ -70,6 +75,9 @@ class Application:
 
         if self.config.mode == "wandb":
             wandb.finish()
+
+        imageio.mimsave("vapl_training.gif", self.render_frames, fps=5)
+        imageio.mimsave("vapl_training_debug.gif", self.render_frames_debug, fps=5)
 
     def render_trained(self, spp):
         self.integrator.set_train(False)
@@ -116,6 +124,23 @@ class Application:
                 else: # it may look not good on wandb
                     wandb.log({"vapl training": wandb.Image(fig)})
 
+                # debug gif for presentation
+                frame = np.clip(image ** (1.0 / 2.2), 0, 1)  
+                frame = (frame * 255).astype(np.uint8)      
+                self.render_frames.append(frame) 
+
+                canvas = FigureCanvas(fig)
+                canvas.draw()
+                width, height = canvas.get_width_height()
+                rgba = np.frombuffer(canvas.buffer_rgba(), dtype=np.uint8).reshape(height, width, 4)
+                bbox = ax[1].get_window_extent().transformed(fig.dpi_scale_trans.inverted())
+                x0, y0, x1, y1 = bbox.extents
+                x0, y0, x1, y1 = map(int, [x0 * fig.dpi, y0 * fig.dpi, x1 * fig.dpi, y1 * fig.dpi])
+                frame_ax1 = rgba[y0:y1, x0:x1, :3]
+                self.render_frames_debug.append(frame_ax1)
+
+                plt.close(fig)
+
     def should_render(self, epoch):
         if self.config.mode == "sweep":
             return False
@@ -139,7 +164,7 @@ class Application:
         amplitude_norm = amplitude / amplitude.max() if amplitude.max() != 0 else amplitude
         colors = amplitude_norm
 
-        point_sizes = 10 * variance
+        point_sizes = 25 * variance
 
         axis_nds = world_to_ndc(scene, axis.cpu().detach().numpy())
         axis_pix = ndc_to_pixel(axis_nds, h, w)
