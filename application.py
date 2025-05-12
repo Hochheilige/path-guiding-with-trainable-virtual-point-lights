@@ -30,8 +30,11 @@ class Application:
             self.scene : mi.Scene = mi.load_file(config.scene)
 
         self.grid = vapl_grid_base.create_vapl_grid(config, self.scene.bbox().min, self.scene.bbox().max)
-        self.loss_function = Loss(relativeL2)
-        self.integrator = RHSIntegrator(self.grid, self.loss_function, True)
+        self.loss_function = Loss(torch.nn.MSELoss())
+        if self.config.grid.layout == "nrc":
+            self.integrator = RHSIntegrator(self.grid, self.loss_function, True, True)
+        else:
+            self.integrator = RHSIntegrator(self.grid, self.loss_function, True)
 
         if config.mode == "wandb":
             wandb.login()

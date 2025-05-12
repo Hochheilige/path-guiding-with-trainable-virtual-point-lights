@@ -163,12 +163,14 @@ def relativeL2(ref, prediction, pdf):
     return rL2
 
 class RHSIntegrator(ADIntegrator):
-    def __init__(self, model, loss_function : Loss, train, props=mi.Properties()):
+    def __init__(self, model, loss_function : Loss, train, is_nrc = False, sweep_encoding = None, props=mi.Properties()):
         super().__init__(props)
         self.train = train
         self.model = model
         self.losses = []
         self.loss_function = loss_function
+        self.sweep_encoding = sweep_encoding
+        self.is_nrc = is_nrc
 
     def set_train(self, train):
         self.train = train
@@ -262,9 +264,101 @@ class RHSIntegrator(ADIntegrator):
         )
         si.compute_uv_partials(ray)
 
-        gaussians, vmfs = self.model(si)
-        mixture = vapl_mixture(gaussians, vmfs)
-        mixture.convolve_with_bsdf(si, ray.d)
+        if self.is_nrc != True:
+            gaussians, vmfs = self.model(si)
+            mixture = vapl_mixture(gaussians, vmfs, self.sweep_encoding)
+            mixture.convolve(si, ray.d)
+        else:
+            def encode_position(position):
+                # Инкодинг позиции через частоты (3 + 12)
+                return encode_frequency(position)  # [N, 36]
+                #return torch.cat([position, freqs_position], dim=-1)  # [N, 3 + 12]
+
+            def encode_roughness(roughness, resolution=4):
+                """
+                Преобразует шероховатость [N, 1] в 4 признака через 1 - exp(-r), затем one-blob (гауссианское окно).
+                """
+                r = 1.0 - torch.exp(-roughness)  # [N, 1], как в статье
+                centers = torch.linspace(0.0, 1.0, resolution, device=r.device)  # [4]
+                r_expanded = r.unsqueeze(-1)  # [N, 1, 1]
+                encoding = torch.exp(-((r_expanded - centers) ** 2) * 40.0)  # [N, 1, 4]
+                return encoding.view(-1, resolution)  # [N, 4]
+
+            def encode_reflectance(reflectance):
+                # Простой инкодинг для диффузного и спекулярного отражения (RGB)
+                return reflectance  # [N, 3]
+
+            def encode_frequency(x):
+                # Частотный инкодинг для позиционных данных: 6 частот => 6 * 2 * 3 = 36
+                freqs = []
+                for i in range(6):  # 6 частот
+                    freq = 2 ** i
+                    freqs.append(torch.sin(freq * x))  # [N, 3]
+                    freqs.append(torch.cos(freq * x))  # [N, 3]
+                return torch.cat(freqs, dim=-1)
+            
+            def encode_spherical_like_one_blob(x, resolution=8):
+                """
+                One-blob encoding направления/нормали (вектор [N, 3]) в 8 признаков.
+                Проецируем вектор в 1D и дискретизируем.
+                """
+                x = torch.nn.functional.normalize(x, p=2, dim=1)  # [N, 3]
+                direction_scalar = x[:, 0] * 0.2989 + x[:, 1] * 0.5870 + x[:, 2] * 0.1140  # проекция (весовая средняя)
+                direction_scalar = direction_scalar.unsqueeze(-1)  # [N, 1]
+
+                centers = torch.linspace(-1.0, 1.0, resolution, device=x.device)  # [8]
+                gauss = torch.exp(-((direction_scalar - centers) ** 2) * 40.0)  # [N, 8]
+                return gauss  # [N, 8]
+
+            # Основной код
+            position = si.p.torch().permute(1, 0)  # [N, 3]
+            normal = si.sh_frame.n.torch().permute(1, 0)  # shading normal, [N, 3]
+            direction = -si.wi.torch().permute(1, 0)  # [N, 3]
+
+            view_dir_normalize = (torch.nn.functional.normalize(ray.d.torch().permute(1, 0), p=2, dim=1, eps=1e-6))
+            wo_world = -view_dir_normalize
+
+            bsdf = si.bsdf()
+            wo_ts = si.sh_frame.to_local(mi.Vector3f(wo_world.permute(1, 0)))
+            ctx_diffuse = mi.BSDFContext()
+            ctx_diffuse.type_mask = mi.BSDFFlags.Diffuse
+            ctx_specular = mi.BSDFContext()
+            ctx_specular.type_mask = mi.BSDFFlags.Glossy
+            roughness = bsdf.eval_attribute_1("alpha", si).torch().unsqueeze(1)  # [N, 1]
+
+            diffuse: mi.Spectrum = bsdf.eval(ctx_diffuse, si, wo_ts)  # [N, 3]
+            specular: mi.Spectrum = bsdf.eval(ctx_specular, si, wo_ts)  # [N, 3]
+            diffuse_tensor: torch.Tensor = diffuse.torch().permute(1, 0)
+            specular_tensor: torch.Tensor = specular.torch().permute(1, 0)
+
+            # Инкодирование параметров
+            encoded_position = encode_position(position)  # [N, 3 + 12]
+            #print(encoded_position.shape)
+            encoded_normal = encode_spherical_like_one_blob(normal)  # [N, 8]
+            #print(encoded_normal.shape)
+            encoded_direction = encode_spherical_like_one_blob(direction)  # [N, 8]
+            #print(encoded_direction.shape)
+            encoded_roughness = encode_roughness(roughness)  # [N, 4]
+            #print(encoded_roughness.shape)
+            encoded_diffuse = encode_reflectance(diffuse_tensor)  # [N, 3]
+            #print(encoded_diffuse.shape)
+            encoded_specular = encode_reflectance(specular_tensor)  # [N, 3]
+            #print(encoded_specular.shape)
+
+            # Объединение инкодированных данных
+            inputs = torch.cat([
+                encoded_position,       # [N, 3 + 12]
+                encoded_normal,         # [N, 8]
+                encoded_direction,      # [N, 8]
+                encoded_roughness,      # [N, 4]
+                encoded_diffuse,        # [N, 3]
+                encoded_specular        # [N, 3]
+            ], dim=1).cuda()
+
+            #print(inputs.shape)  # Размерность после инкодинга должна быть [N, 64]
+
+            # Прогон данных через модель
+            vapl_l = self.model(inputs)
 
         # update si and bsdf with the first non-specular ones
         si, β, _ = first_non_specular_or_null_si(scene, si, sampler, β)
@@ -288,7 +382,9 @@ class RHSIntegrator(ADIntegrator):
             res_l = res_l + (L)
             bss.append(bs)
 
-        vapl_l = mixture.illumination
+        if self.is_nrc != True:
+            vapl_l = mixture.illumination
+
         return res_l, vapl_l, bss[0].pdf.torch().unsqueeze(-1), si
 
 
