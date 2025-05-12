@@ -30,7 +30,7 @@ class Application:
             self.scene : mi.Scene = mi.load_file(config.scene)
 
         self.grid = vapl_grid_base.create_vapl_grid(config, self.scene.bbox().min, self.scene.bbox().max)
-        self.loss_function = Loss(torch.nn.MSELoss())
+        self.loss_function = Loss(relative_l2_loss_with_luminance)
         if self.config.grid.layout == "nrc":
             self.integrator = RHSIntegrator(self.grid, self.loss_function, True, True)
         else:

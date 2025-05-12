@@ -52,7 +52,7 @@ class vapl_grid_base(torch.nn.Module):
         self.config = config
         self.bb_min = torch.tensor(bb_min, device="cuda")
         self.bb_max = torch.tensor(bb_max, device="cuda")
-       
+
         self.num_param_per_gaussian = 4
         self.num_param_per_vmf = 8
 
@@ -83,7 +83,7 @@ class vapl_grid_base(torch.nn.Module):
             return vapl_grid_nrc(config, bb_min, bb_max).cuda()
         else:
             return vapl_grid(config, bb_min, bb_max).cuda()
-        
+
     def sample_vpls(self, pos):
         block_size = 1.0 / self.config.grid.resolution
         normalized_pos = (pos - self.bb_min) / (self.bb_max - self.bb_min)
@@ -107,14 +107,14 @@ class vapl_grid_base(torch.nn.Module):
                     total_vmf = total_vmf + vmf
 
         return total_gaussians, total_vmf
-    
+
     def sweep_encoding(self, gaussians, vmf):
         if (self.config.sweep_config.gaussian_mean_encoding == "raw"):
             mean = encoders[self.config.sweep_config.gaussian_mean_encoding](gaussians[:, :3])
         else:
             mean = encoders[self.config.sweep_config.gaussian_mean_encoding](gaussians[:, :3])
             mean = mean * (self.bb_max - self.bb_min) + self.bb_min
-        
+
         variance = encoders[self.config.sweep_config.gaussian_variance_encoding](gaussians[:, 3]).unsqueeze(1)
         sharpness = encoders[self.config.sweep_config.vmf_sharpness_encoding](vmf[:, 0]).unsqueeze(1)
 
@@ -125,19 +125,19 @@ class vapl_grid_base(torch.nn.Module):
         else:
             axis = encoders[self.config.sweep_config.vmf_axis_encoding](vmf[:, 1:4])
             amplitude = encoders[self.config.sweep_config.vmf_amplitude_encoding](vmf[:, 4:7])
-                
+
         gaussians = torch.cat([mean, variance], dim = 1)
         vmf = torch.cat([sharpness, axis, amplitude], dim = 1)
 
         return gaussians, vmf
-    
+
     def encoding(self, gaussians, vmf):
         if (self.config.grid.gaussian_mean_encoding == "raw"):
             mean = encoders[self.config.grid.gaussian_mean_encoding](gaussians[:, :3])
         else:
             mean = encoders[self.config.grid.gaussian_mean_encoding](gaussians[:, :3])
             mean = mean * (self.bb_max - self.bb_min) + self.bb_min
-        
+
         variance = encoders[self.config.grid.gaussian_variance_encoding](gaussians[:, 3]).unsqueeze(1)
         sharpness = encoders[self.config.grid.vmf_sharpness_encoding](vmf[:, 0]).unsqueeze(1)
 
@@ -174,7 +174,7 @@ class vapl_grid_base(torch.nn.Module):
             vmf : torch.Tensor = self.vmf_grid(X).to(dtype=torch.float32)
 
         return gaussians, vmf
-    
+
     def get_gaussians_for_debug_render(self):
         with torch.no_grad():
             resolution = int(self.config.grid.resolution / 8) # FIXME hack hack
@@ -185,11 +185,11 @@ class vapl_grid_base(torch.nn.Module):
 
             grid_points = torch.stack([X.flatten(), Y.flatten(), Z.flatten()], dim=-1)
             world_positions : torch.Tensor = grid_points * (self.bb_max - self.bb_min) + self.bb_min
-            
+
             gaussians : torch.Tensor = self.gaussian_grid(world_positions).to(dtype=torch.float32)
             vmf : torch.Tensor = self.vmf_grid(world_positions).to(dtype=torch.float32)
             return self.encode(gaussians, vmf)
-        
+
 class vapl_grid(vapl_grid_base):
     def __init__(self, config, bb_min, bb_max):
         super().__init__(config, bb_min, bb_max)
@@ -204,8 +204,8 @@ class vapl_grid(vapl_grid_base):
 
     def forward(self, input):
         gaussians, vmf = self.get_vapls(input)
-        return self.encode(gaussians, vmf)                
-        
+        return self.encode(gaussians, vmf)
+
 class vapl_grid_mlp(vapl_grid_base):
     def __init__(self, config, bb_min, bb_max):
         super().__init__(config, bb_min, bb_max)
@@ -239,30 +239,26 @@ class vapl_grid_mlp(vapl_grid_base):
         vmf = outputs[:, 4:11]
 
         return self.encode(gaussians, vmf)
-    
+
 class vapl_grid_nrc(vapl_grid_base):
     def __init__(self, config, bb_min, bb_max):
         super().__init__(config, bb_min, bb_max)
 
-        self.output_dim = 3  # RGB
-        self.input_dim = 62  # как ранее обсуждали: 3 + 3 + 3 + 1 + 3 + 3
+        self.output_dim = 3
+        self.input_dim = 62
 
         network_config = {
             "otype": "MLP",
-            "n_neurons": 64,             # как в статье
-            "n_hidden_layers": 5         # 5 скрытых слоёв = 7 слоёв всего
+            "n_neurons": 64,
+            "n_hidden_layers": 5
         }
 
         self.mlp = tcnn.Network(self.input_dim, self.output_dim, network_config)
         self.optimizer = torch.optim.Adam(self.mlp.parameters(), lr=self.learning_rate)
 
     def forward(self, x):
-        """
-        x: [N, 16] вход — позиция, нормаль, направление, roughness, 
-           диффузный и зеркальный цвет
-        """
         return self.mlp(x)
-    
+
 # helper functions for debug vapl visualization
 def world_to_ndc(scene, batch):
     """Transforms 3D world coordinates into normalized device coordinates (NDC) using the perspective transformation matrix.
