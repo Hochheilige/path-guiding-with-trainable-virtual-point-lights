@@ -292,8 +292,12 @@ class RHSIntegrator(ADIntegrator):
             res_l = res_l + (L)
             bss.append(bs)
 
+        path_pdf = bss[0].pdf
+        for bs in bss[1:]:
+            path_pdf *= bs.pdf
+
         vapl_l = mixture.illumination
-        return res_l, vapl_l, bss[0].pdf.torch().unsqueeze(-1), si
+        return res_l, vapl_l, path_pdf.torch().unsqueeze(-1), si
 
 
     def sample(self,
