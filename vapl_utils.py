@@ -241,7 +241,7 @@ def isotropic_ndf_filtering(si: mi.SurfaceInteraction3f):
         alpha_v_val = bsdf.eval_attribute_1("alpha_v", si, active=alpha_uv_mask)
         alpha_u = dr.select(alpha_uv_mask, alpha_u_val, alpha_u)
         alpha_v = dr.select(alpha_uv_mask, alpha_v_val, alpha_v)
- 
+
     alpha_u = alpha_u.torch()
     alpha_v = alpha_v.torch()
 
@@ -496,6 +496,16 @@ class vapl_mixture:
         sampled_dir : torch.Tensor = sample_vmf(axis, sharpness[:, :1])
         return sampled_dir.permute(1, 0)
 
+    def sg_evaluate(self, dir):
+        dir = torch.nn.functional.normalize(dir, dim=-1)
+        d = dir - self.axis
+        len2 = torch.sum(d ** 2, dim=-1)
+        return torch.exp(-0.5 * self.sharpness * len2).unsqueeze_(-1)
+
+    def vpl_light(self, dir):
+        ev = self.sg_evaluate(dir)
+        return self.amplitude * self.sg_evaluate(dir)
+
     def convolve_with_bsdf(self, si : mi.SurfaceInteraction3f, view_dir : mi.Vector3f):
         SGLIGHT_SHARPNESS_MAX = float.fromhex("0x1.0p41")
         eps = 1e-4
@@ -540,7 +550,7 @@ class vapl_mixture:
         ctx_diffuse = mi.BSDFContext()
         ctx_diffuse.type_mask = mi.BSDFFlags.Diffuse
         diffuse : mi.Spectrum = bsdf.eval(ctx_diffuse, si, wo_ts)
-        
+
         # Diffuse SG lighting.
 		# [Tokuyoshi et al. 2024 "Hierarchical Light Sampling with Accurate Spherical Gaussian Lighting", Section 4]
         amplitude = torch.exp(self.light_lobe_log_amplitude)
@@ -663,7 +673,7 @@ class vapl_mixture:
         specular : mi.Spectrum = bsdf.eval(ctx_specular, si, wo_ts)
         specular_tensor : torch.Tensor = specular.torch().permute(1, 0)
         print_tensor_stats(specular_tensor, "bsdf glossy")
-        
+
         specular_illumination = amplitude * visibility * lobe * sg_int
         specular_illumination_result = specular_tensor * specular_illumination
         print_tensor_stats(specular_illumination_result, "specular result")

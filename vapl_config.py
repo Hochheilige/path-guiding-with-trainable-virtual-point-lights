@@ -5,7 +5,7 @@ class Config(dict):
             if isinstance(value, dict):
                 value = Config(value)
             self[key] = value
-        self.__dict__ = self 
+        self.__dict__ = self
 
 raw_config = {
     "scene"     : "cornell box", # cornell box, veach mis
@@ -13,8 +13,8 @@ raw_config = {
     "sweep_config" : None,       # add to use sweep
     "run_name"     : None,       # for wandb runs
     "grid" : {
-        "layout" :                    "regular",   # regular, mlp
-        "resolution" :                 16,       
+        "layout" :                    "mlp",   # regular, mlp
+        "resolution" :                 16,
         "num_gaussians_in_mixture" :   1,
         "interpolation" :             "Nearest",   # [Nearest, Linear, Smooth]
         "gaussian_mean_encoding":     "raw",       # [raw, eps-norm, min-max-norm]
@@ -23,14 +23,14 @@ raw_config = {
         "vmf_axis_encoding":          "normalize", # [raw, normalize, spherical, spherical-norm]
         "vmf_amplitude_encoding":     "exp",       # [relu, softplus, exp]
         "accumulate_gaussians" :       True,
-    }, 
+    },
     # It is also possible to pass optimizer type here
     # but right now I don't see the reason to do that
     "optimizer" : {
         "learning_rate" :  0.001,
         "regularization" : False,
     },
-    "epoch" : 1000,
+    "epoch" : 500,
     "spp" : 1
 }
 

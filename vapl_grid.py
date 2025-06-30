@@ -80,7 +80,7 @@ class vapl_grid_base(torch.nn.Module):
         if config.grid.layout == "mlp":
             return vapl_grid_mlp(config, bb_min, bb_max).cuda()
         elif config.grid.layout == "nrc":
-            return vapl_grid_nrc(config, bb_min, bb_max).cuda()
+            return nrc_model(config, bb_min, bb_max).cuda()
         else:
             return vapl_grid(config, bb_min, bb_max).cuda()
 
@@ -240,24 +240,37 @@ class vapl_grid_mlp(vapl_grid_base):
 
         return self.encode(gaussians, vmf)
 
-class vapl_grid_nrc(vapl_grid_base):
+class nrc_model(vapl_grid_base):
     def __init__(self, config, bb_min, bb_max):
         super().__init__(config, bb_min, bb_max)
 
-        self.output_dim = 3
-        self.input_dim = 62
+        # Define the architecture as per the NRC paper
+        layers = []
 
-        network_config = {
-            "otype": "MLP",
-            "n_neurons": 64,
-            "n_hidden_layers": 5
-        }
+        input_dim = 62
+        output_dim = 3
+        n_hidden_layers = 5
+        n_neurons=64
 
-        self.mlp = tcnn.Network(self.input_dim, self.output_dim, network_config)
-        self.optimizer = torch.optim.Adam(self.mlp.parameters(), lr=self.learning_rate)
+        # Input layer
+        layers.append(torch.nn.Linear(input_dim, n_neurons, bias=False))  # No bias as per NRC paper
+        layers.append(torch.nn.ReLU())
+
+        # Hidden layers
+        for _ in range(n_hidden_layers):
+            layers.append(torch.nn.Linear(n_neurons, n_neurons, bias=False))  # No bias
+            layers.append(torch.nn.ReLU())
+
+        # Output layer
+        layers.append(torch.nn.Linear(n_neurons, output_dim, bias=False))  # No bias
+
+        self.network = torch.nn.Sequential(*layers)
+
+        # Optimizer
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
 
     def forward(self, x):
-        return self.mlp(x)
+        return self.network(x)
 
 # helper functions for debug vapl visualization
 def world_to_ndc(scene, batch):
