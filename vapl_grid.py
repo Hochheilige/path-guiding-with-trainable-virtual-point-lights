@@ -121,23 +121,41 @@ class vapl_grid_base(torch.nn.Module):
         block_size = 1.0 / self.config.grid.resolution
         normalized_pos = (pos - self.bb_min) / (self.bb_max - self.bb_min)
 
-        total_gaussians = self.gaussian_grid(normalized_pos).to(dtype=torch.float32)
-        total_vmf = self.vmf_grid(normalized_pos).to(dtype=torch.float32)
+        if (self.config.grid.num_gaussians_in_mixture > 1):
+            grid_output = self.gaussian_grid(normalized_pos).to(dtype=torch.float32)
+            gaussians_split = grid_output.view(grid_output.shape[0], -1, self.num_param_per_gaussian)
+            gaussians_list = [gaussians_split[:, i, :] for i in range(gaussians_split.shape[1])]
 
-        for dx in [-1, 0, 1]:
-            for dy in [-1, 0, 1]:
-                for dz in [-1, 0, 1]:
-                    if dx == 0 and dy == 0 and dz == 0:
-                        continue
+            grid_output = self.vmf_grid(normalized_pos).to(dtype=torch.float32)
+            vmf_split = grid_output.view(grid_output.shape[0], -1, self.num_param_per_vmf)
+            vmf_list = [vmf_split[:, i, :] for i in range(vmf_split.shape[1])]
 
-                    offset = torch.tensor([dx, dy, dz], device="cuda") * block_size
-                    neighbor_pos = normalized_pos + offset
+            total_gaussians = torch.zeros_like(gaussians_list[0])
+            total_vmf = torch.zeros_like(vmf_list[0])
 
-                    gaussians = self.gaussian_grid(neighbor_pos).to(dtype=torch.float32)
-                    vmf = self.vmf_grid(neighbor_pos).to(dtype=torch.float32)
+            for g in gaussians_list:
+                total_gaussians += g
 
-                    total_gaussians = total_gaussians + gaussians
-                    total_vmf = total_vmf + vmf
+            for v in vmf_list:
+                total_vmf += v
+        else:
+            total_gaussians = self.gaussian_grid(normalized_pos).to(dtype=torch.float32)
+            total_vmf = self.vmf_grid(normalized_pos).to(dtype=torch.float32)
+
+            for dx in [-1, 0, 1]:
+                for dy in [-1, 0, 1]:
+                    for dz in [-1, 0, 1]:
+                        if dx == 0 and dy == 0 and dz == 0:
+                            continue
+
+                        offset = torch.tensor([dx, dy, dz], device="cuda") * block_size
+                        neighbor_pos = normalized_pos + offset
+
+                        gaussians = self.gaussian_grid(neighbor_pos).to(dtype=torch.float32)
+                        vmf = self.vmf_grid(neighbor_pos).to(dtype=torch.float32)
+
+                        total_gaussians = total_gaussians + gaussians
+                        total_vmf = total_vmf + vmf
 
         return total_gaussians, total_vmf
 
