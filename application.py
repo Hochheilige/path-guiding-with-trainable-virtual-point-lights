@@ -30,8 +30,9 @@ class Application:
             self.scene : mi.Scene = mi.load_file(config.scene)
 
         self.grid = vapl_grid_base.create_vapl_grid(config, self.scene.bbox().min, self.scene.bbox().max)
-        self.loss_function = Loss(relativeL2)
+        self.loss_function = Loss(relativeL2_luminance_tiny_cuda_nn)
         self.integrator = RHSIntegrator(self.grid, self.loss_function, True)
+        self.integrator.set_depth(self.config.depth)
 
         if config.mode == "wandb":
             wandb.login()
@@ -60,6 +61,16 @@ class Application:
                 name=self.config.run_name,
                 config=self.config
             )
+
+        # draw reference image
+        self.integrator.set_train(False)
+        image = mi.render(self.scene, spp=self.config.spp, integrator=self.integrator)
+        fig, ax = plt.subplots()
+        ax.imshow(np.clip(image ** (1.0 / 2.2), 0, 1))
+        ax.axis("off")
+        ax.set_title(f"Reference image")
+        plt.show()
+        self.integrator.set_train(True)
 
         for epoch in range(self.epoch):
             self.integrator.epoch = epoch

@@ -9,6 +9,7 @@ torch.autograd.set_detect_anomaly(True)
 
 import numpy as np
 import matplotlib.pyplot as plt
+import random
 
 def minmaxnorm(x):
     return (x - x.min()) / (x.max() - x.min())
@@ -86,26 +87,33 @@ class vapl_grid_base(torch.nn.Module):
         self.config = config
 
     def sample_vpls(self, pos):
-        block_size = 1.0 / self.config.grid.resolution
         normalized_pos = (pos - self.bb_min) / (self.bb_max - self.bb_min)
 
-        gaussians_list = [self.gaussian_grid(normalized_pos).to(dtype=torch.float32)]
-        vmf_list = [self.vmf_grid(normalized_pos).to(dtype=torch.float32)]
+        if (self.config.grid.num_gaussians_in_mixture > 1):
+            gaussians_list = [self.gaussian_grid(normalized_pos).to(dtype=torch.float32)]
+            vmf_list = [self.vmf_grid(normalized_pos).to(dtype=torch.float32)]
+        else:
+            block_size = 1.0 / self.config.grid.resolution
+            gaussians_list = [self.gaussian_grid(normalized_pos).to(dtype=torch.float32)]
+            vmf_list = [self.vmf_grid(normalized_pos).to(dtype=torch.float32)]
+            neighbor_offsets = [
+                torch.tensor([dx, dy, dz], device="cuda") * block_size
+                for dx in [-1, 0, 1]
+                for dy in [-1, 0, 1]
+                for dz in [-1, 0, 1]
+                if not (dx == 0 and dy == 0 and dz == 0)
+            ]
 
-        for dx in [-1, 0, 1]:
-            for dy in [-1, 0, 1]:
-                for dz in [-1, 0, 1]:
-                    if dx == 0 and dy == 0 and dz == 0:
-                        continue
+            random_neighbors = random.sample(neighbor_offsets, 3)
 
-                    offset = torch.tensor([dx, dy, dz], device="cuda") * block_size
-                    neighbor_pos = normalized_pos + offset
+            for offset in random_neighbors:
+                neighbor_pos = normalized_pos + offset
 
-                    gaussians = self.gaussian_grid(neighbor_pos).to(dtype=torch.float32)
-                    vmf = self.vmf_grid(neighbor_pos).to(dtype=torch.float32)
+                gaussians = self.gaussian_grid(neighbor_pos).to(dtype=torch.float32)
+                vmf = self.vmf_grid(neighbor_pos).to(dtype=torch.float32)
 
-                    gaussians_list.append(gaussians)
-                    vmf_list.append(vmf)
+                gaussians_list.append(gaussians)
+                vmf_list.append(vmf)
 
         return gaussians_list, vmf_list
 

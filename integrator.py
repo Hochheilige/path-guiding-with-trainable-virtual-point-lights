@@ -162,6 +162,49 @@ def relativeL2(prediction, ref, pdf):
     rL2 = rL2.mean()
     return rL2
 
+def relativeL2_luminance(prediction, reference):
+    eps=1e-2
+    # luminance: 0.2126 R + 0.7152 G + 0.0722 B
+    luminance = (prediction.detach() * torch.tensor([0.2126, 0.7152, 0.0722], device=prediction.device)).sum(dim=1, keepdim=True)
+    denom = luminance ** 2 + eps
+
+    loss = ((prediction - reference) ** 2) / denom
+    loss = loss[~torch.isnan(loss) & ~torch.isinf(loss)]
+    return loss.mean()
+
+def relativeL2_luminance_tiny_cuda_nn(pred, target, pdf=None):
+    loss_scale=1.0
+    eps=1e-2
+
+    N = pred.shape
+    device = pred.device
+
+    rgb = pred[:, 0:3]
+    luminance = (0.299 * rgb[:, 0] + 0.587 * rgb[:, 1] + 0.114 * rgb[:, 2]).detach()
+    denom = luminance ** 2 + eps
+
+    if pdf is None:
+        pdf = torch.ones(N, device=device)
+    else:
+        pdf = pdf.detach().clamp(min=1e-6)
+
+    diff = pred - target
+    sq_error = diff ** 2
+
+    denom = denom.view(-1, 1)
+    pdf = pdf.view(-1, 1)
+    loss = sq_error / denom / pdf
+
+    valid = torch.isfinite(loss)
+    if not torch.all(valid):
+        loss = loss[valid]
+
+    if loss.numel() == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    return loss_scale * loss.mean()
+
+
 class RHSIntegrator(ADIntegrator):
     def __init__(self, model, loss_function : Loss, train, sweep_encoding = None, props=mi.Properties()):
         super().__init__(props)
@@ -170,9 +213,13 @@ class RHSIntegrator(ADIntegrator):
         self.losses = []
         self.loss_function = loss_function
         self.sweep_encoding = sweep_encoding
+        self.depth = 1
 
     def set_train(self, train):
         self.train = train
+
+    def set_depth(self, depth):
+        self.depth = depth
 
     # Basics for Path-tracing using trained vapls
     @dr.syntax
@@ -276,7 +323,45 @@ class RHSIntegrator(ADIntegrator):
         # TODO: make this better but not critical
         bss = []
 
-        for depth in range(4):
+        for depth in range(self.depth):
+            if (depth > 0):
+                si = scene.ray_intersect(
+                    ray, ray_flags=mi.RayFlags.All, coherent=(depth==0)
+                )
+
+                # update si and bsdf with the first non-specular ones
+                si, β, _ = first_non_specular_or_null_si(scene, si, sampler, β)
+
+            L, bs, β = render_rhs_original(scene, si, sampler, β)
+            ray = si.spawn_ray(si.to_world(bs.wo))
+
+            res_l = res_l + (L)
+            bss.append(bs)
+
+        path_pdf = bss[0].pdf
+        vapl_l = mixture.illumination
+
+        return res_l, vapl_l, path_pdf.torch().unsqueeze(-1), si
+
+    def sample_training_ref(self, scene: mi.Scene, sampler: mi.Sampler, ray: mi.Ray3f, depth: mi.UInt32):
+        w, h = list(scene.sensors()[0].film().size())
+        L = mi.Spectrum(0)
+        β = mi.Spectrum(1)
+        bsdf_ctx = mi.BSDFContext()
+
+        ray = mi.Ray3f(dr.detach(ray))
+        vapl_l = torch.zeros((w*h, 3), device="cuda")
+        res_l = mi.Spectrum(0)
+
+        si = scene.ray_intersect(
+            ray, ray_flags=mi.RayFlags.All, coherent=(depth==0)
+        )
+        si.compute_uv_partials(ray)
+
+        # update si and bsdf with the first non-specular ones
+        si, β, _ = first_non_specular_or_null_si(scene, si, sampler, β)
+
+        for depth in range(self.depth):
             if (depth > 0):
                 si = scene.ray_intersect(
                     ray, ray_flags=mi.RayFlags.All, coherent=(depth==0)
@@ -290,15 +375,8 @@ class RHSIntegrator(ADIntegrator):
             ray = si.spawn_ray(si.to_world(bs.wo))
 
             res_l = res_l + (L)
-            bss.append(bs)
 
-        path_pdf = bss[0].pdf
-        for bs in bss[1:]:
-            path_pdf *= bs.pdf
-
-        vapl_l = mixture.illumination
-        return res_l, vapl_l, path_pdf.torch().unsqueeze(-1), si
-
+        return res_l, si
 
     def sample(self,
                mode: dr.ADMode,
@@ -314,9 +392,9 @@ class RHSIntegrator(ADIntegrator):
         if self.train:
             L, L_vapl, weight, si = self.sample_training(scene, sampler, ray, depth)
 
-            L_tensor = torch.from_numpy(L.numpy()).to("cuda").T
+            L_ref = torch.from_numpy(L.numpy()).to("cuda").T
 
-            loss : torch.Tensor = self.loss_function(L_vapl, L_tensor, weight)
+            loss : torch.Tensor = self.loss_function(L_vapl, L_ref, None)
             self.losses.append(loss.detach().cpu())
             self.model.optimizer.zero_grad()
             loss.backward()
@@ -325,6 +403,6 @@ class RHSIntegrator(ADIntegrator):
             torch.cuda.empty_cache()
             return L_vapl.permute(1, 0), si.is_valid(), [], mi.Spectrum(0)
         else:
-            L, si = self.sample_using_vapls(mode, scene, sampler, ray, depth, δL, δaovs, state_in, active)
+            L, si = self.sample_training_ref(scene, sampler, ray, depth)
             return L, si.is_valid(), [], mi.Spectrum(0)
 
