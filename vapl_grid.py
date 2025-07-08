@@ -117,6 +117,30 @@ class vapl_grid_base(torch.nn.Module):
 
         return gaussians_list, vmf_list
 
+    def sample_vpls_accumulate_params(self, pos):
+        block_size = 1.0 / self.config.grid.resolution
+        normalized_pos = (pos - self.bb_min) / (self.bb_max - self.bb_min)
+
+        total_gaussians = self.gaussian_grid(normalized_pos).to(dtype=torch.float32)
+        total_vmf = self.vmf_grid(normalized_pos).to(dtype=torch.float32)
+
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                for dz in [-1, 0, 1]:
+                    if dx == 0 and dy == 0 and dz == 0:
+                        continue
+
+                    offset = torch.tensor([dx, dy, dz], device="cuda") * block_size
+                    neighbor_pos = normalized_pos + offset
+
+                    gaussians = self.gaussian_grid(neighbor_pos).to(dtype=torch.float32)
+                    vmf = self.vmf_grid(neighbor_pos).to(dtype=torch.float32)
+
+                    total_gaussians = total_gaussians + gaussians
+                    total_vmf = total_vmf + vmf
+
+        return total_gaussians, total_vmf
+
     def sweep_encoding(self, gaussians, vmf):
         def process_tensors(gaussians, vmf):
             if (self.config.sweep_config.gaussian_mean_encoding == "raw"):
@@ -201,7 +225,10 @@ class vapl_grid_base(torch.nn.Module):
             pos = input
 
         if self.config.grid.accumulate_gaussians == True:
-            return self.sample_vpls(pos)
+            if self.config.grid.accumulate_radiance == True:
+                return self.sample_vpls(pos)
+            else:
+                return self.sample_vpls_accumulate_params(pos)
         else:
             X = (pos - self.bb_min) / (self.bb_max - self.bb_min)
             gaussians : torch.Tensor = self.gaussian_grid(X).to(dtype=torch.float32)

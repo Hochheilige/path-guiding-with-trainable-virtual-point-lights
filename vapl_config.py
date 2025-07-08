@@ -23,6 +23,7 @@ raw_config = {
         "vmf_axis_encoding":          "normalize", # [raw, normalize, spherical, spherical-norm]
         "vmf_amplitude_encoding":     "exp",       # [relu, softplus, exp]
         "accumulate_gaussians" :       False,
+        "accumulate_radiance" :        True,       # radiance or parameters of vapls
     },
     # It is also possible to pass optimizer type here
     # but right now I don't see the reason to do that
