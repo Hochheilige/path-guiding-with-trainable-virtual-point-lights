@@ -177,7 +177,7 @@ def relativeL2_luminance_tiny_cuda_nn(pred, target, pdf=None):
     eps=1e-2
 
     assert pred.shape == target.shape, "Prediction and target must have the same shape"
-    N = pred.shape
+    N, C = pred.shape
     device = pred.device
 
     rgb = pred[:, 0:3]
