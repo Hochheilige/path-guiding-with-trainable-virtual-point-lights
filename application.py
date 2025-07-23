@@ -52,9 +52,13 @@ class Application:
             self.config.sweep_config = wandb.config
             self.epoch = self.config.sweep_config.epoch
             self.train()
-            self.integrator.set_config(self.sweep_config.vmf_axis_encoding)
 
     def train(self):
+        if (self.config.mode == "sweep"):
+            self.integrator.set_config(self.config.sweep_config.vmf_axis_encoding)
+        else:
+            self.integrator.set_config(self.config.grid.vmf_axis_encoding)
+
         if self.config.mode == "wandb":
             wandb.init(
                 project="vapls-training",

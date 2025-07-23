@@ -61,7 +61,7 @@ class vapl_grid_base(torch.nn.Module):
             "encoding": {
                 "otype": "HashGrid",
                 "base_resolution": config.grid.resolution,
-                "n_levels": config.grid.num_gaussians_in_mixture,
+                "n_levels": config.grid.n_levels,
                 "n_features_per_level": self.num_param_per_gaussian,
                 "log2_hashmap_size": 22,
                 "interpolation": config.grid.interpolation
@@ -89,9 +89,14 @@ class vapl_grid_base(torch.nn.Module):
     def sample_vpls(self, pos):
         normalized_pos = (pos - self.bb_min) / (self.bb_max - self.bb_min)
 
-        if (self.config.grid.num_gaussians_in_mixture > 1):
-            gaussians_list = [self.gaussian_grid(normalized_pos).to(dtype=torch.float32)]
-            vmf_list = [self.vmf_grid(normalized_pos).to(dtype=torch.float32)]
+        if (self.config.grid.n_levels > 1):
+            grid_output = self.gaussian_grid(normalized_pos).to(dtype=torch.float32)
+            gaussians_split = grid_output.view(grid_output.shape[0], -1, self.num_param_per_gaussian)
+            gaussians_list = [gaussians_split[:, i, :] for i in range(gaussians_split.shape[1])]
+
+            grid_output = self.vmf_grid(normalized_pos).to(dtype=torch.float32)
+            vmf_split = grid_output.view(grid_output.shape[0], -1, self.num_param_per_vmf)
+            vmf_list = [vmf_split[:, i, :] for i in range(vmf_split.shape[1])]
         else:
             block_size = 1.0 / self.config.grid.resolution
             gaussians_list = [self.gaussian_grid(normalized_pos).to(dtype=torch.float32)]
@@ -104,7 +109,7 @@ class vapl_grid_base(torch.nn.Module):
                 if not (dx == 0 and dy == 0 and dz == 0)
             ]
 
-            random_neighbors = random.sample(neighbor_offsets, 3)
+            random_neighbors = random.sample(neighbor_offsets, self.config.grid.num_neighbours_to_sample)
 
             for offset in random_neighbors:
                 neighbor_pos = normalized_pos + offset
@@ -114,6 +119,29 @@ class vapl_grid_base(torch.nn.Module):
 
                 gaussians_list.append(gaussians)
                 vmf_list.append(vmf)
+        # else:
+        #     block_size = 1.0 / self.config.grid.resolution
+        #     gaussians_list = [self.gaussian_grid(normalized_pos).to(dtype=torch.float32)]
+        #     vmf_list       = [self.vmf_grid(normalized_pos).to(dtype=torch.float32)]
+
+        #     # Фиксированные смещения только по оси X (влево и вправо)
+        #     neighbor_offsets = [
+        #         torch.tensor([dx, 0, 0], device="cuda") * block_size
+        #         for dx in (-1, 1)
+        #     ]
+
+        #     # Берём ровно num_neighbours_to_sample первых (или всех, если их меньше)
+        #     num = self.config.grid.num_neighbours_to_sample
+        #     fixed_neighbors = neighbor_offsets[:num]
+
+        #     for offset in fixed_neighbors:
+        #         neighbor_pos = normalized_pos + offset
+
+        #         gaussians = self.gaussian_grid(neighbor_pos).to(dtype=torch.float32)
+        #         vmf       = self.vmf_grid(neighbor_pos).to(dtype=torch.float32)
+
+        #         gaussians_list.append(gaussians)
+        #         vmf_list.append(vmf)
 
         return gaussians_list, vmf_list
 
@@ -121,7 +149,7 @@ class vapl_grid_base(torch.nn.Module):
         block_size = 1.0 / self.config.grid.resolution
         normalized_pos = (pos - self.bb_min) / (self.bb_max - self.bb_min)
 
-        if (self.config.grid.num_gaussians_in_mixture > 1):
+        if (self.config.grid.n_levels > 1):
             grid_output = self.gaussian_grid(normalized_pos).to(dtype=torch.float32)
             gaussians_split = grid_output.view(grid_output.shape[0], -1, self.num_param_per_gaussian)
             gaussians_list = [gaussians_split[:, i, :] for i in range(gaussians_split.shape[1])]

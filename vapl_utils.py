@@ -12,6 +12,25 @@ torch.autograd.set_detect_anomaly(True)
 import matplotlib.pyplot as plt
 import numpy as np
 
+import torch.nn.functional as F
+
+def spherical(tensor_list):
+    result = []
+    for x in tensor_list:
+        theta = torch.sigmoid(x[:, 0])
+        phi = torch.sigmoid(x[:, 1])
+        axis = torch.stack([
+            torch.sin(theta) * torch.cos(phi),
+            torch.sin(theta) * torch.sin(phi),
+            torch.cos(theta)
+        ], dim=1)  # (N, 3)
+        result.append(axis)
+    return result
+
+def spherical_norm(tensor_list):
+    return [F.normalize(vec, dim=1) for vec in spherical(tensor_list)]
+
+
 """
 In relation to Hierachical Light Sampling paper by AMD, light is going to be represented as pair of Gaussian + vMF
     * Isotropic Gaussian, approximates the light positions distirbution
@@ -133,7 +152,10 @@ def sg_clamp_cosine_product_integral_over_pi(cosine: torch.Tensor, sharpness: to
     return 2.0 * torch.lerp(lower_integral, upper_integral, lerp_factor)
 
 def sggx(m: torch.Tensor, roughness_mat: torch.Tensor) -> torch.Tensor:
-    det = torch.det(roughness_mat).clamp(min=1e-7)
+    # more safe option for det 
+    sign, logabsdet = torch.linalg.slogdet(roughness_mat)
+    logabsdet = torch.clamp(logabsdet, min=-14.0, max=40) # not sure in this clamp
+    det = sign * torch.exp(logabsdet)
 
     roughness_mat_adj = torch.stack([
         torch.stack([roughness_mat[..., 1, 1], -roughness_mat[..., 0, 1]], dim=-1),
@@ -148,10 +170,11 @@ def sggx(m: torch.Tensor, roughness_mat: torch.Tensor) -> torch.Tensor:
 
     length2 = length2.clamp(min=1e-4)
 
-    sqrt_det = torch.sqrt(det).clamp(min=1e-4)
-
+    sqrt_det = torch.sqrt(det).clamp(min=1e-4, max=1e-4)
     denom = sqrt_det * length2 ** 2
-    return 1.0 / (math.pi * denom)
+
+    result = 1.0 / (torch.pi * denom)
+    return result
 
 # Approximate the reflection lobe with an SG lobe for microfacet BRDFs.
 # [Wang et al. 2009 "All-Frequency Rendering with Dynamic, Spatially-Varying Reflectance"]
@@ -459,8 +482,13 @@ class vapl_mixture:
         self.variance = [g[:, 3] for g in gaussians]
         self.sharpness = [v[:, 0] for v in vmfs]
         # need to pass config here because axis not always 1:4 and amplitude not always 4:7
-        if sweep_encoding == "spherical" or sweep_encoding == "spherical-norm":
-            self.axis = [v[:, 1:3] for v in vmfs]
+        if sweep_encoding == "spherical":
+            axis = [v[:, 1:3] for v in vmfs]
+            self.axis = spherical(axis)
+            self.amplitude = [v[:, 3:6] for v in vmfs]
+        elif sweep_encoding == "spherical-norm":
+            axis = [v[:, 1:3] for v in vmfs]
+            self.axis = spherical_norm(axis)
             self.amplitude = [v[:, 3:6] for v in vmfs]
         else:
             self.axis = [v[:, 1:4] for v in vmfs]
