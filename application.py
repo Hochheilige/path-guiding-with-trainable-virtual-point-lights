@@ -3,6 +3,7 @@ mi.set_variant("cuda_ad_rgb")
 import numpy as np
 import matplotlib.pyplot as plt
 import wandb
+import gc
 
 from integrator import *
 from vapl_grid import *
@@ -49,15 +50,23 @@ class Application:
     def sweep(self):
         if self.config.mode == "sweep":
             wandb.init(project="vapls-parameters-encodings-search")
-            self.config.sweep_config = wandb.config
-            self.epoch = self.config.sweep_config.epoch
+            self.recreate()
             self.train()
 
+    def recreate(self):
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        dr.flush_malloc_cache()
+        self.config.sweep_config = wandb.config
+        self.epoch = self.config.sweep_config.epoch
+        self.grid = vapl_grid_base.create_vapl_grid(self.config, self.scene.bbox().min, self.scene.bbox().max)
+        self.integrator = RHSIntegrator(self.grid, self.loss_function, True)
+        self.integrator.set_depth(self.config.depth)
+        self.integrator.set_config(self.config.sweep_config.vmf_axis_encoding)
+
     def train(self):
-        if (self.config.mode == "sweep"):
-            self.grid.set_config(self.config)
-            self.integrator.set_config(self.config.sweep_config.vmf_axis_encoding)
-        else:
+        if (self.config.mode != "sweep"):
             self.integrator.set_config(self.config.grid.vmf_axis_encoding)
 
         if self.config.mode == "wandb":
