@@ -42,7 +42,6 @@ encoders = {
     "spherical": spherical,
     "spherical-norm": spherical_norm,
     "eps-norm" : eps_norm,
-    "min-max-norm": minmaxnorm,
     "raw": lambda x: x,
 }
 
