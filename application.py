@@ -55,6 +55,7 @@ class Application:
 
     def train(self):
         if (self.config.mode == "sweep"):
+            self.grid.set_config(self.config)
             self.integrator.set_config(self.config.sweep_config.vmf_axis_encoding)
         else:
             self.integrator.set_config(self.config.grid.vmf_axis_encoding)
