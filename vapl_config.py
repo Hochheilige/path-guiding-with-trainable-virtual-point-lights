@@ -21,7 +21,7 @@ raw_config = {
         "gaussian_variance_encoding": "sigmoid",  # [exp, sigmoid, softplus]
         "vmf_amplitude_encoding":     "exp",       # [relu, softplus, exp]
         "vmf_axis_encoding":          "raw", # [raw, normalize, spherical, spherical-norm]
-        "vmf_sharpness_encoding":     "exp",  # [exp, relu, sigmoid, softplus]
+        "vmf_sharpness_encoding":     "softplus",  # [exp, relu, sigmoid, softplus]
         "accumulate_gaussians" :       True,
         "accumulate_radiance" :        True,       # radiance or parameters of vapls
         "num_neighbours_to_sample":    3,          # when accumulate radiance by neigbours
