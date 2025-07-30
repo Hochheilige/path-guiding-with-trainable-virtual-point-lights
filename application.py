@@ -54,10 +54,33 @@ class Application:
             self.train()
 
     def recreate(self):
+        del self.grid
+        del self.integrator
+        del self.scene
         gc.collect()
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
+        dr.kernel_history_clear()
         dr.flush_malloc_cache()
+        dr.malloc_clear_statistics()
+        dr.flush_kernel_cache()
+        if self.config.scene == "cornell box":
+            # cornell box with specular sphere
+            scene_dict = mi.cornell_box()
+            scene_dict['sphere'] = {
+               'type': 'sphere',
+               'radius': 0.4,
+               'center': [0, 0.2, 0],
+               'bsdf': {
+                   'type': 'roughconductor',
+                   'distribution': 'ggx',
+                   'alpha_u': 0.5,
+                   'alpha_v': 0.1
+               },
+            }
+            self.scene : mi.Scene = mi.load_dict(scene_dict)
+        else:
+            self.scene : mi.Scene = mi.load_file(self.config.scene)
         self.config.sweep_config = wandb.config
         self.epoch = self.config.sweep_config.epoch
         self.grid = vapl_grid_base.create_vapl_grid(self.config, self.scene.bbox().min, self.scene.bbox().max)
