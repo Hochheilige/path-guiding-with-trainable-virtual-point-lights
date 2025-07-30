@@ -1,0 +1,18 @@
+program: train.py
+method: bayes
+metric:
+  name: loss
+  goal: minimize
+parameters:
+  gaussian_mean_encoding:
+    values: ["raw", "eps-norm"]
+  gaussian_variance_encoding:
+    values: ["exp", "sigmoid", "softplus"]
+  vmf_sharpness_encoding:
+    values: ["exp", "relu", "sigmoid", "softplus"]
+  vmf_axis_encoding:
+    values: ["raw", "normalize", "spherical", "spherical-norm"]
+  vmf_amplitude_encoding:
+    values: ["relu", "softplus", "exp"]
+  epoch:
+    values: [200]
