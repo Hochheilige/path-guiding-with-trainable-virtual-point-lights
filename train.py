@@ -27,6 +27,7 @@ def train():
     wandb.init()
     wandb_config = wandb.config
     config = vapl_config.config
+    config.mode = "sweep"
     config.sweep_config = wandb_config
     grid = vapl_grid.vapl_grid_base.create_vapl_grid(config, scene.bbox().min, scene.bbox().max)
     loss_fn = Loss(relativeL2_luminance_tiny_cuda_nn)
