@@ -8,15 +8,16 @@ class Config(dict):
         self.__dict__ = self
 
 raw_config = {
-    "scene"     : "cornell box", # cornell box, veach mis
+    "scene"     : "cornell box", # cornell box, veach_mis
     "mode"      : "local",       # local, wandb, sweep
+    "wandb_group"  : "default",
     "sweep_config" : None,       # add to use sweep
     "run_name"     : None,       # for wandb runs
     "grid" : {
-        "layout" :                    "regular",   # regular, mlp
+        "layout" :                    "mlp",   # regular, mlp
         "resolution" :                 2,
         "n_levels" :                   4,
-        "interpolation" :             "Nearest",   # [Nearest, Linear, Smooth]
+        "interpolation" :             "Nearest",   # [Nearest, Linear, Smoothstep]
         "gaussian_mean_encoding":     "eps-norm",       # [raw, eps-norm]
         "gaussian_variance_encoding": "sigmoid",  # [exp, sigmoid, softplus]
         "vmf_amplitude_encoding":     "exp",       # [relu, softplus, exp]
@@ -32,7 +33,7 @@ raw_config = {
         "learning_rate" :  0.001,
         "regularization" : False,
     },
-    "epoch" : 201,
+    "epoch" : 1500,
     "spp" : 1,
     "depth" : 1
 }

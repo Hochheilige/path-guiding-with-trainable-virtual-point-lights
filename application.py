@@ -93,11 +93,19 @@ class Application:
             self.integrator.set_config(self.config.grid.vmf_axis_encoding)
 
         if self.config.mode == "wandb":
-            wandb.init(
-                project="vapls-training",
-                name=self.config.run_name,
-                config=self.config
-            )
+            if self.config.wandb_group == "default":
+                wandb.init(
+                    project="vapls-training",
+                    name=self.config.run_name,
+                    config=self.config
+                )
+            else:
+                wandb.init(
+                    project="vapls-training",
+                    name=self.config.run_name,
+                    group=self.config.wandb_group,
+                    config=self.config
+                )
 
         # draw reference image
         self.integrator.set_train(False)
