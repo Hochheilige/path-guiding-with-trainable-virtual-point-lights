@@ -135,33 +135,42 @@ class Application:
         if self.config.mode in ["wandb", "sweep"]:
             wandb.log({"loss": self.integrator.losses[-1].item(), "epoch": epoch})
 
-        if self.should_render(epoch):
-            with torch.no_grad():
-                gaussians_list, vmfs_list = self.grid.get_gaussians_for_debug_render()
+        if not self.should_render(epoch):
+            return
 
-                h, w = image.shape[0], image.shape[1]
+        with torch.no_grad():
+            gaussians_list, vmfs_list = self.grid.get_gaussians_for_debug_render()
+            h, w = image.shape[0], image.shape[1]
 
-                fig, ax = plt.subplots(1, 2, figsize=(12, 6))
+            n_levels = self.config.grid.n_levels
+            total_plots = n_levels + 1
 
-                ax[0].imshow(np.clip(image ** (1.0 / 2.2), 0, 1))
-                ax[0].axis("off")
+            gaussians_list = gaussians_list[:n_levels]
+            vmfs_list = vmfs_list[:n_levels]
 
-                for gaussians, vmfs in zip(gaussians_list, vmfs_list):
-                    mean = gaussians[:, :3]
-                    variance = gaussians[:, 3]
-                    amplitude = vmfs[:, 4:7]
-                    axis = vmfs[:, 1:4]
-                    self.debug_vapl_render(self.scene, mean, variance, amplitude, axis, h, w, ax[1])
+            fig, axs = plt.subplots(1, total_plots, figsize=(6 * total_plots, 6))
 
-                ax[1].imshow(np.clip(image ** (1.0 / 2.2), 0, 1))
-                ax[1].axis("off")
+            axs[0].imshow(np.clip(image ** (1.0 / 2.2), 0, 1))
+            axs[0].axis("off")
+            axs[0].set_title(f"vapl render - epoch:{epoch}")
 
-                if self.config.mode == "local":
-                    ax[0].set_title(f"vapl render - epoch:{epoch}")
-                    ax[1].set_title(f"vapl debug - epoch:{epoch}")
-                    plt.show()
-                else:
-                    wandb.log({"vapl training": wandb.Image(fig)})
+            for level, (gaussians, vmfs) in enumerate(zip(gaussians_list, vmfs_list)):
+                mean = gaussians[:, :3]
+                variance = gaussians[:, 3]
+                amplitude = vmfs[:, 4:7]
+                axis = vmfs[:, 1:4]
+
+                self.debug_vapl_render(self.scene, mean, variance, amplitude, axis, h, w, axs[level + 1])
+                axs[level + 1].imshow(np.clip(image ** (1.0 / 2.2), 0, 1))
+                axs[level + 1].axis("off")
+                axs[level + 1].set_title(f"level {level}")
+
+            plt.tight_layout()
+
+            if self.config.mode == "local":
+                plt.show()
+            else:
+                wandb.log({f"vapl training": wandb.Image(fig)})
 
     def should_render(self, epoch):
         if self.config.mode == "sweep":
