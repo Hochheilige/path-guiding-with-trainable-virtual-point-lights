@@ -132,17 +132,12 @@ class Application:
         plt.show()
 
     def render(self, epoch, image):
-        if (self.config.mode == "wandb" or self.config.mode == "sweep"):
+        if self.config.mode in ["wandb", "sweep"]:
             wandb.log({"loss": self.integrator.losses[-1].item(), "epoch": epoch})
 
-        if (self.should_render(epoch)):
+        if self.should_render(epoch):
             with torch.no_grad():
-                gaussians, vmfs = self.grid.get_gaussians_for_debug_render()
-
-                mean = gaussians[:, :3]
-                variance = gaussians[:, 3]
-                amplitude = vmfs[:, 4:7]
-                axis = vmfs[:, 1:4]
+                gaussians_list, vmfs_list = self.grid.get_gaussians_for_debug_render()
 
                 h, w = image.shape[0], image.shape[1]
 
@@ -151,7 +146,13 @@ class Application:
                 ax[0].imshow(np.clip(image ** (1.0 / 2.2), 0, 1))
                 ax[0].axis("off")
 
-                self.debug_vapl_render(self.scene, mean, variance, amplitude,axis, h, w, ax[1])
+                for gaussians, vmfs in zip(gaussians_list, vmfs_list):
+                    mean = gaussians[:, :3]
+                    variance = gaussians[:, 3]
+                    amplitude = vmfs[:, 4:7]
+                    axis = vmfs[:, 1:4]
+                    self.debug_vapl_render(self.scene, mean, variance, amplitude, axis, h, w, ax[1])
+
                 ax[1].imshow(np.clip(image ** (1.0 / 2.2), 0, 1))
                 ax[1].axis("off")
 
@@ -159,7 +160,7 @@ class Application:
                     ax[0].set_title(f"vapl render - epoch:{epoch}")
                     ax[1].set_title(f"vapl debug - epoch:{epoch}")
                     plt.show()
-                else: # it may look not good on wandb
+                else:
                     wandb.log({"vapl training": wandb.Image(fig)})
 
     def should_render(self, epoch):

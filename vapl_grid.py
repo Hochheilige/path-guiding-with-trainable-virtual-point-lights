@@ -283,18 +283,21 @@ class vapl_grid_base(torch.nn.Module):
 
     def get_gaussians_for_debug_render(self):
         with torch.no_grad():
-            resolution = int(self.config.grid.resolution) # FIXME hack hack
+            base_resolution = int(self.config.grid.resolution)
+            n_levels = int(self.config.grid.n_levels)
             device = "cuda"
-
-            lin = torch.linspace(0, 1, resolution, device=device)
+    
+            effective_resolution = base_resolution * (2 ** (n_levels - 1))
+    
+            lin = torch.linspace(0, 1, effective_resolution, device=device)
             X, Y, Z = torch.meshgrid(lin, lin, lin, indexing='ij')
-
             grid_points = torch.stack([X.flatten(), Y.flatten(), Z.flatten()], dim=-1)
-            world_positions : torch.Tensor = grid_points * (self.bb_max - self.bb_min) + self.bb_min
-
-            gaussians : torch.Tensor = self.gaussian_grid(world_positions).to(dtype=torch.float32)
-            vmf : torch.Tensor = self.vmf_grid(world_positions).to(dtype=torch.float32)
+    
+            world_positions = grid_points * (self.bb_max - self.bb_min) + self.bb_min
+    
+            gaussians, vmf = self.get_vapls(world_positions)
             return self.encode(gaussians, vmf)
+
 
 class vapl_grid(vapl_grid_base):
     def __init__(self, config, bb_min, bb_max):
