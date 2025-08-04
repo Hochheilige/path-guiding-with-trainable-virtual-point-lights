@@ -177,22 +177,25 @@ class Application:
 
     def debug_vapl_render(self, scene, pos, variance, amplitude, axis, h, w, ax):
         p = pos.cpu().detach().numpy()
-        variance = variance.cpu().detach().numpy().flatten()
         amplitude = amplitude.cpu().detach().numpy()
+        variance = variance.cpu().detach().numpy().flatten()
+
         means_ndc = world_to_ndc(scene, p)
         means_pix = ndc_to_pixel(means_ndc, h, w)
 
-        amplitude_norm = amplitude / amplitude.max() if amplitude.max() != 0 else amplitude
-        colors = amplitude_norm
+        colors = amplitude / (amplitude.max() + 1e-8)
 
-        point_sizes = 10 * variance
+        sigma = np.sqrt(variance)
+        point_sizes = (sigma / sigma.max() * 50)
 
-        axis_nds = world_to_ndc(scene, axis.cpu().detach().numpy())
-        axis_pix = ndc_to_pixel(axis_nds, h, w)
+        axis = axis.cpu().detach().numpy()
+        axis_ndc = world_to_ndc(scene, p + axis * 0.05)
+        axis_pix = ndc_to_pixel(axis_ndc, h, w)
 
         dx = axis_pix.x - means_pix.x
         dy = axis_pix.y - means_pix.y
 
-        ax.scatter(means_pix.x, means_pix.y, c=colors, cmap='coolwarm', marker='o', s=point_sizes)
+        ax.scatter(means_pix.x, means_pix.y, c=colors, s=point_sizes, marker='o')
         # TODO: figure out how to render arrows more correct
-        #ax.quiver(means_pix.x, means_pix.y, dx, dy, angles='uv', color=colors, scale=1, scale_units='xy')
+        #ax.quiver(means_pix.x, means_pix.y, dx, dy, angles='uv', scale=1, scale_units='xy', color=colors)
+
