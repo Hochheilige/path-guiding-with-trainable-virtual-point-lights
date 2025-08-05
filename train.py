@@ -40,7 +40,7 @@ def train():
     mi.render(scene, spp=config.spp, integrator=integrator)
     integrator.set_train(True)
 
-    for epoch in range(config.epoch):
+    for epoch in range(wandb_config.epoch):
         integrator.epoch = epoch
         mi.render(scene, spp=config.spp, integrator=integrator)
         wandb.log({"loss": integrator.losses[-1].item(), "epoch": epoch})
