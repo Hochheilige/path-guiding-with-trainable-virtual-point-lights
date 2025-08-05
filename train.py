@@ -35,6 +35,11 @@ def train():
     integrator.set_depth(config.depth)
     integrator.set_config(wandb_config.vmf_axis_encoding)
 
+    # store GT image
+    integrator.set_train(False)
+    mi.render(scene, spp=config.spp, integrator=integrator)
+    integrator.set_train(True)
+
     for epoch in range(config.epoch):
         integrator.epoch = epoch
         mi.render(scene, spp=config.spp, integrator=integrator)
