@@ -215,6 +215,7 @@ class RHSIntegrator(ADIntegrator):
         self.loss_function = loss_function
         self.sweep_encoding = sweep_encoding
         self.depth = 1
+        self.gt_light = mi.Spectrum(1)
 
     def set_train(self, train):
         self.train = train
@@ -301,14 +302,10 @@ class RHSIntegrator(ADIntegrator):
 
     def sample_training(self, scene: mi.Scene, sampler: mi.Sampler, ray: mi.Ray3f, depth: mi.UInt32):
         w, h = list(scene.sensors()[0].film().size())
-        L = mi.Spectrum(0)
-        β = mi.Spectrum(1)
-        bsdf_ctx = mi.BSDFContext()
-
+        
         ray = mi.Ray3f(dr.detach(ray))
         vapl_l = torch.zeros((w*h, 3), device="cuda")
-        res_l = mi.Spectrum(0)
-
+        
         si = scene.ray_intersect(
             ray, ray_flags=mi.RayFlags.All, coherent=(depth==0)
         )
@@ -318,31 +315,9 @@ class RHSIntegrator(ADIntegrator):
         mixture = vapl_mixture(gaussians, vmfs, self.sweep_encoding)
         mixture.convolve(si, ray.d)
 
-        # update si and bsdf with the first non-specular ones
-        si, β, _ = first_non_specular_or_null_si(scene, si, sampler, β)
-
-        # TODO: make this better but not critical
-        bss = []
-
-        for depth in range(self.depth):
-            if (depth > 0):
-                si = scene.ray_intersect(
-                    ray, ray_flags=mi.RayFlags.All, coherent=(depth==0)
-                )
-
-                # update si and bsdf with the first non-specular ones
-                si, β, _ = first_non_specular_or_null_si(scene, si, sampler, β)
-
-            L, bs, β = render_rhs_original(scene, si, sampler, β)
-            ray = si.spawn_ray(si.to_world(bs.wo))
-
-            res_l = res_l + (L)
-            bss.append(bs)
-
-        path_pdf = bss[0].pdf
         vapl_l = mixture.illumination
 
-        return res_l, vapl_l, path_pdf.torch().unsqueeze(-1), si
+        return vapl_l, si
 
     def sample_training_ref(self, scene: mi.Scene, sampler: mi.Sampler, ray: mi.Ray3f, depth: mi.UInt32):
         w, h = list(scene.sensors()[0].film().size())
@@ -377,6 +352,7 @@ class RHSIntegrator(ADIntegrator):
 
             res_l = res_l + (L)
 
+        self.gt_light = res_l
         return res_l, si
 
     def sample(self,
@@ -391,18 +367,17 @@ class RHSIntegrator(ADIntegrator):
                active):
 
         if self.train:
-            L, L_vapl, weight, si = self.sample_training(scene, sampler, ray, depth)
+            vapl_light, si = self.sample_training(scene, sampler, ray, depth)
+            GT_Light = torch.from_numpy(self.gt_light.numpy()).to("cuda").T
 
-            L_ref = torch.from_numpy(L.numpy()).to("cuda").T
-
-            loss : torch.Tensor = self.loss_function(L_vapl, L_ref, None)
+            loss : torch.Tensor = self.loss_function(vapl_light, GT_Light, None)
             self.losses.append(loss.detach().cpu())
             self.model.optimizer.zero_grad()
             loss.backward()
             self.model.optimizer.step()
 
             torch.cuda.empty_cache()
-            return L_vapl.permute(1, 0), si.is_valid(), [], mi.Spectrum(0)
+            return vapl_light.permute(1, 0), si.is_valid(), [], mi.Spectrum(0)
         else:
             L, si = self.sample_training_ref(scene, sampler, ray, depth)
             return L, si.is_valid(), [], mi.Spectrum(0)
