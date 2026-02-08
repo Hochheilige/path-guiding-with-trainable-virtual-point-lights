@@ -302,13 +302,18 @@ class RHSIntegrator(ADIntegrator):
 
     def sample_training(self, scene: mi.Scene, sampler: mi.Sampler, ray: mi.Ray3f, depth: mi.UInt32):
         w, h = list(scene.sensors()[0].film().size())
-        
+
         ray = mi.Ray3f(dr.detach(ray))
         vapl_l = torch.zeros((w*h, 3), device="cuda")
-        
+        β = mi.Spectrum(1)
+
         si = scene.ray_intersect(
             ray, ray_flags=mi.RayFlags.All, coherent=(depth==0)
         )
+
+        # Skip past delta/null surfaces to match sample_training_ref
+        si, β, _ = first_non_specular_or_null_si(scene, si, sampler, β)
+
         si.compute_uv_partials(ray)
 
         gaussians, vmfs = self.model(si)
