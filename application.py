@@ -125,6 +125,9 @@ class Application:
         if self.config.mode == "wandb":
             wandb.finish()
 
+    def get_loss(self):
+        return min(self.integrator.losses)
+
     def render_trained(self, spp):
         self.integrator.set_train(False)
         image = mi.render(self.scene, spp=spp, integrator=self.integrator)

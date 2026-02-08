@@ -14,7 +14,7 @@ raw_config = {
     "sweep_config" : None,       # add to use sweep
     "run_name"     : None,       # for wandb runs
     "grid" : {
-        "layout" :                    "mlp",   # regular, mlp
+        "layout" :                    "regular",   # regular, mlp
         "resolution" :                 2,
         "n_levels" :                   4,
         "interpolation" :             "Nearest",   # [Nearest, Linear, Smoothstep]
@@ -33,7 +33,8 @@ raw_config = {
         "learning_rate" :  0.001,
         "regularization" : False,
     },
-    "epoch" : 1500,
+    "std" : 0.1,
+    "epoch" : 501,
     "spp" : 1,
     "depth" : 1
 }

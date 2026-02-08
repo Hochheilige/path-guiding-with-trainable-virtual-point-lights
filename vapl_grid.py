@@ -75,6 +75,9 @@ class vapl_grid_base(torch.nn.Module):
 
         self.learning_rate = config.optimizer.learning_rate
 
+    def set_current_epoch(self, epoch):
+        self.current_epoch = epoch
+
     @classmethod
     def create_vapl_grid(cls, config , bb_min, bb_max):
         if config.grid.layout == "mlp":
@@ -266,6 +269,19 @@ class vapl_grid_base(torch.nn.Module):
     def get_vapls(self, input):
         if isinstance(input, mi.SurfaceInteraction3f):
             pos = input.p.torch().permute(1, 0)
+            cell_size = (self.bb_max - self.bb_min) / self.config.grid.resolution
+            if (self.current_epoch > 400):
+                std = self.config.std * (0.99 ** (self.current_epoch - 400))
+            else:
+                std = self.config.std
+            offset = torch.randn_like(pos[:, :2]) * std
+
+            s = input.sh_frame.s.torch().permute(1, 0)
+            t = input.sh_frame.t.torch().permute(1, 0)
+
+            offset_world = s * offset[:, :1] + t * offset[:, 1:]
+
+            pos = pos + offset_world
         elif isinstance(input, torch.Tensor):
             pos = input
 
@@ -326,23 +342,32 @@ class vapl_grid_mlp(vapl_grid_base):
     def __init__(self, config, bb_min, bb_max):
         super().__init__(config, bb_min, bb_max)
 
-        layers = []
-        input_dim =  12 #num_param_per_gaussian + num_param_per_vmf
-        hidden_dim = 32
+        n_levels = config.grid.n_levels if config.grid.n_levels > 1 else self.config.grid.num_neighbours_to_sample + 1
+
+        input_dim = 12
         output_dim = 11
+        hidden_dim = 64
+        n_hidden_layers = 5
 
-        for _ in range(3):
-            layers.append(torch.nn.Linear(input_dim, hidden_dim))
-            layers.append(torch.nn.LeakyReLU()) # TODO: set it up properly
-            input_dim = hidden_dim
+        self.mlps = torch.nn.ModuleList()
 
-        layers.append(torch.nn.Linear(hidden_dim, output_dim))
-        self.fc = torch.nn.Sequential(*layers)
+        for _ in range(n_levels):
+            layers = []
+            layers.append(torch.nn.Linear(input_dim, hidden_dim, bias=False))
+            layers.append(torch.nn.ReLU())
+
+            for _ in range(n_hidden_layers):
+                layers.append(torch.nn.Linear(hidden_dim, hidden_dim, bias=False))
+                layers.append(torch.nn.ReLU())
+
+            layers.append(torch.nn.Linear(hidden_dim, output_dim, bias=False))
+            mlp = torch.nn.Sequential(*layers)
+            self.mlps.append(mlp)
 
         self.optimizer = torch.optim.Adam(
             list(self.gaussian_grid.parameters()) +
             list(self.vmf_grid.parameters()) +
-            list(self.fc.parameters()),
+            list(self.mlps.parameters()),
             lr=self.learning_rate
         )
 
@@ -352,9 +377,9 @@ class vapl_grid_mlp(vapl_grid_base):
         output_gaussians_list = []
         output_vmf_list = []
 
-        for gauss, vmf in zip(gaussians_list, vmf_list):
-            combined_input = torch.cat([gauss, vmf], dim=1)
-            output = self.fc(combined_input)
+        for level, (gauss, vmf) in enumerate(zip(gaussians_list, vmf_list)):
+            combined_input = torch.cat([gauss, vmf], dim=1)  
+            output = self.mlps[level](combined_input)
 
             gaussians_output = output[:, :4]
             vmf_output = output[:, 4:11]
@@ -376,13 +401,20 @@ def world_to_ndc(scene, batch):
     Returns:
         mi.Point3f: Array of 3D points in NDC.
     """
-    sensor = mi.traverse(scene.sensors()[0])
+    sensor : mi.Sensor = mi.traverse(scene.sensors()[0])
     fov = sensor['x_fov']
     near = sensor['near_clip']
     far = sensor['far_clip']
+    
+    trafo = mi.ProjectiveTransform4f().perspective(fov, near, far)
+    to_world_inv = sensor['to_world'].inverse()
+    
+    # Convert both to Transform4f
+    proj_tf = mi.Transform4f(trafo.matrix)
+    world_inv_tf = mi.Transform4f(to_world_inv.matrix)
+    combined = proj_tf @ world_inv_tf
 
-    trafo = mi.Transform4f().perspective(fov, near, far)
-    pts = trafo @ sensor['to_world'].inverse() @ mi.Point3f(np.array(batch.T))
+    pts = combined @ mi.Point3f(np.array(batch.T))
     return pts
 
 def ndc_to_pixel(pts, h, w):

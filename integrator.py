@@ -300,7 +300,7 @@ class RHSIntegrator(ADIntegrator):
     def set_config(self, conf):
         self.sweep_encoding = conf
 
-    def sample_training(self, scene: mi.Scene, sampler: mi.Sampler, ray: mi.Ray3f, depth: mi.UInt32):
+    def sample_training(self, scene: mi.Scene, ray: mi.Ray3f, depth: mi.UInt32):
         w, h = list(scene.sensors()[0].film().size())
 
         ray = mi.Ray3f(dr.detach(ray))
@@ -372,7 +372,8 @@ class RHSIntegrator(ADIntegrator):
                active):
 
         if self.train:
-            vapl_light, si = self.sample_training(scene, sampler, ray, depth)
+            self.model.set_current_epoch(self.epoch)
+            vapl_light, si = self.sample_training(scene, ray, depth)
             GT_Light = torch.from_numpy(self.gt_light.numpy()).to("cuda").T
 
             loss : torch.Tensor = self.loss_function(vapl_light, GT_Light, None)
