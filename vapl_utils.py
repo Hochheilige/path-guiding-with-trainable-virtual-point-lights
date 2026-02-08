@@ -170,7 +170,7 @@ def sggx(m: torch.Tensor, roughness_mat: torch.Tensor) -> torch.Tensor:
 
     length2 = length2.clamp(min=1e-4)
 
-    sqrt_det = torch.sqrt(det).clamp(min=1e-4, max=1e-4)
+    sqrt_det = torch.sqrt(det).clamp(min=1e-4)
     denom = sqrt_det * length2 ** 2
 
     result = 1.0 / (torch.pi * denom)
@@ -628,7 +628,7 @@ class vapl_mixture:
         filtered_proj_roughness_mat[:, 1, 1] = proj_roughness2[:, 1]
 
         doubled_light_lobe_var = 2.0 * light_lobe_variance
-        var_jj_mat = jj_mat
+        var_jj_mat = jj_mat.clone()
         var_jj_mat[:, 0, 0] *= doubled_light_lobe_var
         var_jj_mat[:, 0, 1] *= doubled_light_lobe_var
         var_jj_mat[:, 1, 0] *= doubled_light_lobe_var
@@ -655,18 +655,19 @@ class vapl_mixture:
         # Создаем новую матрицу
         filtered_roughness_mat = torch.zeros_like(filtered_proj_roughness_mat)
 
-        # Если условие выполняется, используем первое выражение
+        denom = 1.0 + tr + det
+
+        # Finite case: (filteredProjRoughnessMat + det) / (1 + tr + det)
         filtered_roughness_mat[:, 0, 0] = torch.minimum(
             filtered_proj_roughness_mat[:, 0, 0] + det,
             flt_max
-        )
+        ) / denom
         filtered_roughness_mat[:, 1, 1] = torch.minimum(
             filtered_proj_roughness_mat[:, 1, 1] + det,
             flt_max
-        )
+        ) / denom
 
-        # Если условие не выполняется, используем второе выражение
-        # Применим это только к тем, для которых условие не выполнено
+        # Non-finite fallback
         filtered_roughness_mat[~is_finite, 0, 0] = torch.minimum(
             filtered_proj_roughness_mat[~is_finite, 0, 0],
             flt_max
