@@ -609,7 +609,7 @@ class vapl_mixture:
         roughness = isotropic_ndf_filtering(si)
         roughness2 = roughness**2
         proj_roughness2 = roughness2 / torch.maximum(1.0 - roughness2, torch.tensor(eps, device=roughness2.device))
-        roughness_max2 = torch.max(roughness, dim=-1, keepdim=True).values
+        roughness_max2 = torch.max(roughness2, dim=-1, keepdim=True).values
 
         reflect_sharpness = (1.0 - roughness_max2) / torch.maximum(2.0 * roughness_max2, torch.tensor(eps, device=roughness2.device))
         reflect_vec_tensor = mi.reflect(wo, normal).torch().permute(1, 0)
@@ -692,24 +692,33 @@ class vapl_mixture:
         print_tensor_stats(visibility, "visibility")
 
         # evaluate the filtered reflection lobe
-        # FIXME: right now I make calulations in world space not in tangent
+        # view direction toward camera in tangent space (positive z)
+        wo_tensor = wo_ts.torch().permute(1, 0)
         light_lobe_axis_tf = si.sh_frame.to_local(mi.Vector3f(self.light_lobe_axis.permute(1, 0)))
-        half_vec_unnormalize = wi_tensor + light_lobe_axis_tf.torch().permute(1, 0)
+        half_vec_unnormalize = wo_tensor + light_lobe_axis_tf.torch().permute(1, 0)
         half_vec = torch.nn.functional.normalize(half_vec_unnormalize, p=2, dim=1, eps=1e-6)
 
-        lobe = sgg_reflection_pdf(wi_tensor, half_vec, filtered_roughness_mat).unsqueeze(1)
+        lobe = sgg_reflection_pdf(wo_tensor, half_vec, filtered_roughness_mat).unsqueeze(1)
         print_tensor_stats(lobe, "lobe")
 
         # TODO: there could be a problem
         sg_int = sg_integral(self.light_lobe_sharpness)
         print_tensor_stats(sg_int, "sg int")
 
-        # Create Glossy BSDF context
-        ctx_specular = mi.BSDFContext()
-        ctx_specular.type_mask = mi.BSDFFlags.Glossy
-        specular : mi.Spectrum = bsdf.eval(ctx_specular, si, wo_ts)
-        specular_tensor : torch.Tensor = specular.torch().permute(1, 0)
-        print_tensor_stats(specular_tensor, "bsdf glossy")
+        # Specular reflectance color from BSDF material.
+        # The SG lighting formula (Eq. 12) already includes the NDF via SGGXReflectionPDF,
+        # so we must NOT multiply by bsdf.eval which would double-count the NDF.
+        # Only glossy surfaces get specular contribution; diffuse surfaces get 0.
+        has_glossy = mi.has_flag(bsdf.flags(), mi.BSDFFlags.Glossy)
+        has_specular_reflectance = bsdf.has_attribute("specular_reflectance", active=True)
+        specular_reflectance = dr.select(
+            has_glossy,
+            dr.select(has_specular_reflectance,
+                       bsdf.eval_attribute_3("specular_reflectance", si, active=has_specular_reflectance),
+                       mi.Spectrum(1.0)),
+            mi.Spectrum(0.0)
+        )
+        specular_tensor = specular_reflectance.torch().permute(1, 0)
 
         specular_illumination = amplitude * visibility * lobe * sg_int
         specular_illumination_result = specular_tensor * specular_illumination
