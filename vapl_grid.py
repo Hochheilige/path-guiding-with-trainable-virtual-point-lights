@@ -269,19 +269,15 @@ class vapl_grid_base(torch.nn.Module):
     def get_vapls(self, input):
         if isinstance(input, mi.SurfaceInteraction3f):
             pos = input.p.torch().permute(1, 0)
-            cell_size = (self.bb_max - self.bb_min) / self.config.grid.resolution
-            if (self.current_epoch > 400):
-                std = self.config.std * (0.99 ** (self.current_epoch - 400))
-            else:
-                std = self.config.std
-            offset = torch.randn_like(pos[:, :2]) * std
 
-            s = input.sh_frame.s.torch().permute(1, 0)
-            t = input.sh_frame.t.torch().permute(1, 0)
+            if self.config.grid.stochastic_interpolation:
+                offset = torch.randn_like(pos[:, :2]) * self.config.grid.stochastic_std
 
-            offset_world = s * offset[:, :1] + t * offset[:, 1:]
+                s = input.sh_frame.s.torch().permute(1, 0)
+                t = input.sh_frame.t.torch().permute(1, 0)
 
-            pos = pos + offset_world
+                offset_world = s * offset[:, :1] + t * offset[:, 1:]
+                pos = pos + offset_world
         elif isinstance(input, torch.Tensor):
             pos = input
 

@@ -8,7 +8,7 @@ class Config(dict):
         self.__dict__ = self
 
 raw_config = {
-    "scene"     : "cornell box", # cornell box, veach_mis
+    "scene"     : "scenes/veach_mis.xml", # cornell box, veach_mis
     "mode"      : "local",       # local, wandb, sweep
     "wandb_group"  : "default",
     "sweep_config" : None,       # add to use sweep
@@ -23,9 +23,11 @@ raw_config = {
         "vmf_amplitude_encoding":     "exp",       # [relu, softplus, exp]
         "vmf_axis_encoding":          "raw", # [raw, normalize, spherical, spherical-norm]
         "vmf_sharpness_encoding":     "softplus",  # [exp, relu, sigmoid, softplus]
-        "accumulate_gaussians" :       True,
-        "accumulate_radiance" :        True,       # radiance or parameters of vapls
+        "accumulate_gaussians" :       False,
+        "accumulate_radiance" :        False,       # radiance or parameters of vapls
         "num_neighbours_to_sample":    3,          # when accumulate radiance by neigbours
+        "stochastic_interpolation":    False,
+        "stochastic_std":              0.1,
     },
     # It is also possible to pass optimizer type here
     # but right now I don't see the reason to do that
@@ -33,7 +35,6 @@ raw_config = {
         "learning_rate" :  0.001,
         "regularization" : False,
     },
-    "std" : 0.1,
     "epoch" : 501,
     "spp" : 1,
     "depth" : 1
