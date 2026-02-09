@@ -340,30 +340,33 @@ class vapl_grid_mlp(vapl_grid_base):
 
         n_levels = config.grid.n_levels if config.grid.n_levels > 1 else self.config.grid.num_neighbours_to_sample + 1
 
-        input_dim = 12
-        output_dim = 11
-        hidden_dim = 64
-        n_hidden_layers = 5
+        # gaussian(4) + vmf(8) = 12 input features per level
+        feature_dim = self.num_param_per_gaussian + self.num_param_per_vmf
+        # shared MLP takes features + level embedding
+        level_embed_dim = 4
+        input_dim = feature_dim + level_embed_dim
+        hidden_dim = 32
 
-        self.mlps = torch.nn.ModuleList()
+        self.level_embedding = torch.nn.Embedding(n_levels, level_embed_dim)
 
-        for _ in range(n_levels):
-            layers = []
-            layers.append(torch.nn.Linear(input_dim, hidden_dim, bias=False))
-            layers.append(torch.nn.ReLU())
+        # Shared MLP: input -> hidden -> hidden -> residual correction
+        self.mlp = torch.nn.Sequential(
+            torch.nn.Linear(input_dim, hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_dim, hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_dim, feature_dim),
+        )
 
-            for _ in range(n_hidden_layers):
-                layers.append(torch.nn.Linear(hidden_dim, hidden_dim, bias=False))
-                layers.append(torch.nn.ReLU())
-
-            layers.append(torch.nn.Linear(hidden_dim, output_dim, bias=False))
-            mlp = torch.nn.Sequential(*layers)
-            self.mlps.append(mlp)
+        # Initialize last layer near zero so residual starts as identity
+        torch.nn.init.zeros_(self.mlp[-1].weight)
+        torch.nn.init.zeros_(self.mlp[-1].bias)
 
         self.optimizer = torch.optim.Adam(
             list(self.gaussian_grid.parameters()) +
             list(self.vmf_grid.parameters()) +
-            list(self.mlps.parameters()),
+            list(self.mlp.parameters()) +
+            list(self.level_embedding.parameters()),
             lr=self.learning_rate
         )
 
@@ -374,14 +377,18 @@ class vapl_grid_mlp(vapl_grid_base):
         output_vmf_list = []
 
         for level, (gauss, vmf) in enumerate(zip(gaussians_list, vmf_list)):
-            combined_input = torch.cat([gauss, vmf], dim=1)  
-            output = self.mlps[level](combined_input)
+            combined = torch.cat([gauss, vmf], dim=1)
 
-            gaussians_output = output[:, :4]
-            vmf_output = output[:, 4:11]
+            level_idx = torch.full((combined.shape[0],), level, device=combined.device, dtype=torch.long)
+            level_embed = self.level_embedding(level_idx)
+            mlp_input = torch.cat([combined, level_embed], dim=1)
 
-            output_gaussians_list.append(gaussians_output)
-            output_vmf_list.append(vmf_output)
+            # Residual: grid features + learned correction
+            correction = self.mlp(mlp_input)
+            refined = combined + correction
+
+            output_gaussians_list.append(refined[:, :self.num_param_per_gaussian])
+            output_vmf_list.append(refined[:, self.num_param_per_gaussian:])
 
         return self.encode(output_gaussians_list, output_vmf_list)
 
