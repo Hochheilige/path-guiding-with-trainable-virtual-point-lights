@@ -8,13 +8,13 @@ class Config(dict):
         self.__dict__ = self
 
 raw_config = {
-    "scene"     : "scenes/veach_mis.xml", # cornell box, veach_mis
+    "scene"     : "cornell box", # cornell box, veach_mis
     "mode"      : "local",       # local, wandb, sweep
     "wandb_group"  : "default",
     "sweep_config" : None,       # add to use sweep
     "run_name"     : None,       # for wandb runs
     "grid" : {
-        "layout" :                    "regular",   # regular, mlp
+        "layout" :                    "drjit",   # regular, mlp, drjit, drjit-mlp
         "resolution" :                 2,
         "n_levels" :                   4,
         "interpolation" :             "Nearest",   # [Nearest, Linear, Smoothstep]

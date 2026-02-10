@@ -144,7 +144,9 @@ class Application:
 
     def render(self, epoch, image):
         if self.config.mode in ["wandb", "sweep"]:
-            wandb.log({"loss": self.integrator.losses[-1].item(), "epoch": epoch})
+            last_loss = self.integrator.losses[-1]
+            loss_val = last_loss.item() if hasattr(last_loss, 'item') else float(last_loss)
+            wandb.log({"loss": loss_val, "epoch": epoch})
 
         if not self.should_render(epoch):
             return
@@ -171,8 +173,8 @@ class Application:
                 amplitude = vmfs[:, 4:7]
                 axis = vmfs[:, 1:4]
 
-                self.debug_vapl_render(self.scene, mean, variance, amplitude, axis, h, w, axs[level + 1])
                 axs[level + 1].imshow(np.clip(image ** (1.0 / 2.2), 0, 1))
+                self.debug_vapl_render(self.scene, mean, variance, amplitude, axis, h, w, axs[level + 1])
                 axs[level + 1].axis("off")
                 axs[level + 1].set_title(f"level {level}")
 
@@ -196,27 +198,78 @@ class Application:
         else:
             return epoch % 250 == 0
 
-    def debug_vapl_render(self, scene, pos, variance, amplitude, axis, h, w, ax):
+    def debug_vapl_render(self, scene, pos, variance, amplitude, axis, h, w, ax, show_directions=False):
         p = pos.cpu().detach().numpy()
         amplitude = amplitude.cpu().detach().numpy()
         variance = variance.cpu().detach().numpy().flatten()
 
+        # Filter by amplitude — keep only VPLs with non-negligible contribution
+        luminance = 0.2126 * amplitude[:, 0] + 0.7152 * amplitude[:, 1] + 0.0722 * amplitude[:, 2]
+        if luminance.size == 0 or luminance.max() == 0:
+            return
+        threshold = luminance.max() * 0.01
+        mask = luminance > threshold
+
+        p = p[mask]
+        amplitude = amplitude[mask]
+        variance = variance[mask]
+        axis = axis.cpu().detach().numpy()[mask]
+
+        if p.shape[0] == 0:
+            return
+
         means_ndc = world_to_ndc(scene, p)
         means_pix = ndc_to_pixel(means_ndc, h, w)
 
+        px = np.array(means_pix.x)
+        py = np.array(means_pix.y)
+        depth = np.array(means_ndc.z)
+
+        # Filter: within image bounds and in front of camera
+        visible = (px >= 0) & (px < w) & (py >= 0) & (py < h) & (depth > 0)
+
+        px, py = px[visible], py[visible]
+        depth = depth[visible]
+        amplitude = amplitude[visible]
+        variance = variance[visible]
+
+        if px.shape[0] == 0:
+            return
+
+        # Sort by depth (far to near) so close VPLs draw on top
+        order = np.argsort(-depth)
+        px, py, depth = px[order], py[order], depth[order]
+        amplitude = amplitude[order]
+        variance = variance[order]
+
+        # Depth-based size: closer = larger (inverse depth, scaled to [10, 80])
+        inv_depth = 1.0 / (depth + 1e-8)
+        inv_depth_norm = (inv_depth - inv_depth.min()) / (inv_depth.max() - inv_depth.min() + 1e-8)
+        point_sizes = 10 + inv_depth_norm * 70
+
+        # Depth-based alpha: closer = more opaque
+        alpha = 0.3 + 0.7 * inv_depth_norm
+
         colors = amplitude / (amplitude.max() + 1e-8)
+        # Add alpha channel
+        colors = np.column_stack([colors, alpha])
 
-        sigma = np.sqrt(variance)
-        point_sizes = (sigma / sigma.max() * 50)
+        ax.scatter(px, py, c=colors, s=point_sizes, marker='o')
 
-        axis = axis.cpu().detach().numpy()
-        axis_ndc = world_to_ndc(scene, p + axis * 0.05)
-        axis_pix = ndc_to_pixel(axis_ndc, h, w)
+        if show_directions:
+            axis = axis[visible][order]
+            p = p[visible][order]
+            axis_ndc = world_to_ndc(scene, p + axis * 0.05)
+            axis_pix = ndc_to_pixel(axis_ndc, h, w)
 
-        dx = axis_pix.x - means_pix.x
-        dy = axis_pix.y - means_pix.y
+            dx = np.array(axis_pix.x) - px
+            dy = np.array(axis_pix.y) - py
 
-        ax.scatter(means_pix.x, means_pix.y, c=colors, s=point_sizes, marker='o')
-        # TODO: figure out how to render arrows more correct
-        #ax.quiver(means_pix.x, means_pix.y, dx, dy, angles='uv', scale=1, scale_units='xy', color=colors)
+            # Normalize arrow lengths to fixed pixel size for readability
+            length = np.sqrt(dx**2 + dy**2) + 1e-8
+            arrow_len = 8.0
+            dx = dx / length * arrow_len
+            dy = dy / length * arrow_len
+
+            ax.quiver(px, py, dx, dy, angles='xy', scale_units='xy', scale=1, color=colors, width=0.003, headwidth=3)
 

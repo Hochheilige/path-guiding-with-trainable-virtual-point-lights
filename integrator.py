@@ -8,6 +8,7 @@ import torch
 torch.autograd.set_detect_anomaly(True)
 
 from vapl_utils import vapl_mixture
+from vapl_utils_drjit import vapl_mixture_drjit
 
 # Base idea of integrator is taken from:
 # https://github.com/krafton-ai/neural-radiosity-tutorial-mitsuba3/blob/main/neural_radiosity.ipynb
@@ -206,6 +207,34 @@ def relativeL2_luminance_tiny_cuda_nn(pred, target, pdf=None):
     return loss_scale * loss.mean()
 
 
+def compute_drjit_loss(pred, target):
+    """Relative L2 luminance loss computed entirely in DrJIT.
+
+    Args:
+        pred: mi.Color3f — predicted illumination
+        target: mi.Spectrum — ground truth from path tracing
+    Returns:
+        mi.Float — scalar loss value
+    """
+    eps = 1e-2
+    # luminance of prediction (detached for denominator)
+    pred_d = dr.detach(pred)
+    luminance = 0.2126 * pred_d.x + 0.7152 * pred_d.y + 0.0722 * pred_d.z
+    denom = luminance * luminance + eps
+
+    diff = pred - target
+    sq_error = dr.squared_norm(diff)
+
+    loss_per_ray = sq_error / denom
+
+    # Filter out non-finite values
+    valid = dr.isfinite(loss_per_ray)
+    loss_per_ray = dr.select(valid, loss_per_ray, mi.Float(0.0))
+
+    n = mi.Float(dr.width(loss_per_ray))
+    return dr.sum(loss_per_ray) / dr.maximum(n, mi.Float(1.0))
+
+
 class RHSIntegrator(ADIntegrator):
     def __init__(self, model, loss_function : Loss, train, sweep_encoding = None, props=mi.Properties()):
         super().__init__(props)
@@ -324,6 +353,32 @@ class RHSIntegrator(ADIntegrator):
 
         return vapl_l, si
 
+    def sample_training_drjit(self, scene, sampler, ray, depth):
+        """DrJIT-native training path — no torch conversions."""
+        ray = mi.Ray3f(dr.detach(ray))
+        beta = mi.Spectrum(1)
+
+        si = scene.ray_intersect(
+            ray, ray_flags=mi.RayFlags.All, coherent=(depth == 0)
+        )
+
+        si, beta, _ = first_non_specular_or_null_si(scene, si, sampler, beta)
+        si.compute_uv_partials(ray)
+
+        gaussians_list, vmfs_list = self.model(si)
+
+        # Evaluate grid outputs to free intermediate JIT memory
+        # before the mixture convolution builds more AD nodes
+        for mean, var in gaussians_list:
+            dr.eval(mean, var)
+        for sh, ax, amp in vmfs_list:
+            dr.eval(sh, ax, amp)
+
+        mixture = vapl_mixture_drjit(gaussians_list, vmfs_list, self.sweep_encoding)
+        mixture.convolve(si, ray.d)
+
+        return mixture.illumination, si
+
     def sample_training_ref(self, scene: mi.Scene, sampler: mi.Sampler, ray: mi.Ray3f, depth: mi.UInt32):
         w, h = list(scene.sensors()[0].film().size())
         L = mi.Spectrum(0)
@@ -373,17 +428,36 @@ class RHSIntegrator(ADIntegrator):
 
         if self.train:
             self.model.set_current_epoch(self.epoch)
-            vapl_light, si = self.sample_training(scene, sampler, ray, depth)
-            GT_Light = torch.from_numpy(self.gt_light.numpy()).to("cuda").T
 
-            loss : torch.Tensor = self.loss_function(vapl_light, GT_Light, None)
-            self.losses.append(loss.detach().cpu())
-            self.model.optimizer.zero_grad()
-            loss.backward()
-            self.model.optimizer.step()
+            if getattr(self.model, '_is_drjit', False):
+                # DrJIT-native training path
+                # ADIntegrator.render() wraps sample() in dr.suspend_grad(),
+                # which suppresses DrJIT AD. We must resume it explicitly.
+                with dr.resume_grad():
+                    vapl_light, si = self.sample_training_drjit(scene, sampler, ray, depth)
 
-            torch.cuda.empty_cache()
-            return vapl_light.permute(1, 0), si.is_valid(), [], mi.Spectrum(0)
+                    loss = compute_drjit_loss(vapl_light, self.gt_light)
+
+                    # Mixed-precision: scale loss before backward, then scaled step
+                    dr.backward(self.model.scaler.scale(loss))
+                    self.model.optimizer.step()
+
+                self.losses.append(float(loss[0]))
+
+                return vapl_light, si.is_valid(), [], mi.Spectrum(0)
+            else:
+                # PyTorch training path (original)
+                vapl_light, si = self.sample_training(scene, sampler, ray, depth)
+                GT_Light = torch.from_numpy(self.gt_light.numpy()).to("cuda").T
+
+                loss : torch.Tensor = self.loss_function(vapl_light, GT_Light, None)
+                self.losses.append(loss.detach().cpu())
+                self.model.optimizer.zero_grad()
+                loss.backward()
+                self.model.optimizer.step()
+
+                torch.cuda.empty_cache()
+                return vapl_light.permute(1, 0), si.is_valid(), [], mi.Spectrum(0)
         else:
             L, si = self.sample_training_ref(scene, sampler, ray, depth)
             return L, si.is_valid(), [], mi.Spectrum(0)

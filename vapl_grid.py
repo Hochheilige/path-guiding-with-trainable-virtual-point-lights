@@ -80,7 +80,13 @@ class vapl_grid_base(torch.nn.Module):
 
     @classmethod
     def create_vapl_grid(cls, config , bb_min, bb_max):
-        if config.grid.layout == "mlp":
+        if config.grid.layout == "drjit":
+            from vapl_grid_drjit import vapl_grid_drjit
+            return vapl_grid_drjit(config, bb_min, bb_max)
+        elif config.grid.layout == "drjit-mlp":
+            from vapl_grid_drjit import vapl_grid_mlp_drjit
+            return vapl_grid_mlp_drjit(config, bb_min, bb_max)
+        elif config.grid.layout == "mlp":
             return vapl_grid_mlp(config, bb_min, bb_max).cuda()
         else:
             return vapl_grid(config, bb_min, bb_max).cuda()
