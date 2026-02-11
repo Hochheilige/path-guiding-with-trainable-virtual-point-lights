@@ -35,12 +35,12 @@ def train():
     integrator.set_depth(config.depth)
     integrator.set_config(wandb_config.vmf_axis_encoding)
 
-    # store GT image
-    integrator.set_train(False)
-    mi.render(scene, spp=config.spp, integrator=integrator)
-    integrator.set_train(True)
-
     for epoch in range(wandb_config.epoch):
+        # Re-render GT each epoch so the model sees fresh noise
+        integrator.set_train(False)
+        mi.render(scene, spp=config.spp, integrator=integrator)
+        integrator.set_train(True)
+
         integrator.epoch = epoch
         mi.render(scene, spp=config.spp, integrator=integrator)
         wandb.log({"loss": integrator.losses[-1].item(), "epoch": epoch})

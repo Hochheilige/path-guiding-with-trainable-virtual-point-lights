@@ -118,6 +118,12 @@ class Application:
         self.integrator.set_train(True)
 
         for epoch in range(self.epoch):
+            # Re-render GT each epoch so the model sees fresh noise
+            # (stochastic optimization averages it out over iterations)
+            self.integrator.set_train(False)
+            mi.render(self.scene, spp=self.config.spp, integrator=self.integrator)
+            self.integrator.set_train(True)
+
             self.integrator.epoch = epoch
             image = mi.render(self.scene, spp=self.config.spp, integrator=self.integrator)
             self.render(epoch, image)
