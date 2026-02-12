@@ -3,12 +3,46 @@ import mitsuba as mi
 mi.set_variant("cuda_ad_rgb")
 
 from drjit.auto.ad import Float16
+from drjit.hashgrid import HashGridEncoding
 
 import math
 import random
 import numpy as np
 
 from vapl_utils_drjit import dr_sigmoid, dr_softplus
+
+
+class VaplHashGridEncoding(HashGridEncoding):
+    """HashGridEncoding with configurable interpolation mode."""
+
+    def __init__(self, *args, interpolation="Linear", **kwargs):
+        super().__init__(*args, **kwargs)
+        self._interpolation = interpolation
+
+    def __call__(self, p, active=True):
+        if self._interpolation != "Nearest":
+            return super().__call__(p, active)
+
+        # Nearest: single vertex lookup per level (no interpolation)
+        _, PositionFloatXf = self._position_types(p)
+        p = PositionFloatXf(p)
+
+        out_values = [self.StorageFloat(0.0)] * (
+            self.n_features_per_level * self.n_levels
+        )
+
+        for level_i in range(self.n_levels):
+            scale = self._level_scale(level_i)
+            p_offset = 0.5 if not self.align_corners or self.torchngp_compat else 0.0
+            pos = dr.fma(p, scale, p_offset)
+
+            # Round to nearest vertex instead of floor + interpolate
+            pos_nearest = self.ArrayXu(dr.round(pos))
+
+            index = self.indexing_function(pos_nearest, level_i)
+            self._acc_features(level_i, 1.0, index, out_values, active)
+
+        return self.StorageFloatXf(*out_values) & active
 
 def spherical(col0, col1):
     theta = dr_sigmoid(col0)
@@ -37,22 +71,26 @@ class vapl_grid_drjit:
         base_res = config.grid.resolution
         hashmap_size = 2**19
 
-        self.gaussian_enc = dr.nn.HashGridEncoding(
+        interp = getattr(config.grid, 'interpolation', 'Linear')
+
+        self.gaussian_enc = VaplHashGridEncoding(
             Float16, 3,
             n_levels=self.n_levels,
             n_features_per_level=self.num_param_per_gaussian,
             hashmap_size=hashmap_size,
             base_resolution=base_res,
-            per_level_scale=2.0
+            per_level_scale=2.0,
+            interpolation=interp,
         )
 
-        self.vmf_enc = dr.nn.HashGridEncoding(
+        self.vmf_enc = VaplHashGridEncoding(
             Float16, 3,
             n_levels=self.n_levels,
             n_features_per_level=self.num_param_per_vmf,
             hashmap_size=hashmap_size,
             base_resolution=base_res,
-            per_level_scale=2.0
+            per_level_scale=2.0,
+            interpolation=interp,
         )
 
         lr = config.optimizer.learning_rate
