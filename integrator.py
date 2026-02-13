@@ -330,28 +330,41 @@ class RHSIntegrator(ADIntegrator):
         self.sweep_encoding = conf
 
     def sample_training(self, scene: mi.Scene, sampler: mi.Sampler, ray: mi.Ray3f, depth: mi.UInt32):
-        w, h = list(scene.sensors()[0].film().size())
-
         ray = mi.Ray3f(dr.detach(ray))
-        vapl_l = torch.zeros((w*h, 3), device="cuda")
         β = mi.Spectrum(1)
 
         si = scene.ray_intersect(
             ray, ray_flags=mi.RayFlags.All, coherent=(depth==0)
         )
 
-        # Skip past delta/null surfaces to match sample_training_ref
+        # Skip past delta/null surfaces
         si, β, _ = first_non_specular_or_null_si(scene, si, sampler, β)
 
         si.compute_uv_partials(ray)
 
+        # Compute ground truth at the same surface interaction
+        with dr.suspend_grad():
+            gt_light = mi.Spectrum(0)
+            β_gt = mi.Spectrum(β)
+            si_gt = si
+            for d in range(self.depth):
+                if d > 0:
+                    si_gt = scene.ray_intersect(
+                        ray_gt, ray_flags=mi.RayFlags.All, coherent=False
+                    )
+                    si_gt, β_gt, _ = first_non_specular_or_null_si(scene, si_gt, sampler, β_gt)
+                L, bs, β_gt = render_rhs_original(scene, si_gt, sampler, β_gt)
+                ray_gt = si_gt.spawn_ray(si_gt.to_world(bs.wo))
+                gt_light += L
+
+        # Compute VAPL prediction at the same si
         gaussians, vmfs = self.model(si)
         mixture = vapl_mixture(gaussians, vmfs, self.sweep_encoding)
         mixture.convolve(si, ray.d)
 
         vapl_l = mixture.illumination
 
-        return vapl_l, si
+        return vapl_l, gt_light, si
 
     def sample_training_drjit(self, scene, sampler, ray, depth):
         """DrJIT-native training path — no torch conversions."""
@@ -365,6 +378,21 @@ class RHSIntegrator(ADIntegrator):
         si, beta, _ = first_non_specular_or_null_si(scene, si, sampler, beta)
         si.compute_uv_partials(ray)
 
+        # Compute ground truth at the same surface interaction
+        with dr.suspend_grad():
+            gt_light = mi.Spectrum(0)
+            beta_gt = mi.Spectrum(beta)
+            si_gt = si
+            for d in range(self.depth):
+                if d > 0:
+                    si_gt = scene.ray_intersect(
+                        ray_gt, ray_flags=mi.RayFlags.All, coherent=False
+                    )
+                    si_gt, beta_gt, _ = first_non_specular_or_null_si(scene, si_gt, sampler, beta_gt)
+                L, bs, beta_gt = render_rhs_original(scene, si_gt, sampler, beta_gt)
+                ray_gt = si_gt.spawn_ray(si_gt.to_world(bs.wo))
+                gt_light += L
+
         gaussians_list, vmfs_list = self.model(si)
 
         # Evaluate grid outputs to free intermediate JIT memory
@@ -377,7 +405,7 @@ class RHSIntegrator(ADIntegrator):
         mixture = vapl_mixture_drjit(gaussians_list, vmfs_list, self.sweep_encoding)
         mixture.convolve(si, ray.d)
 
-        return mixture.illumination, si
+        return mixture.illumination, gt_light, si
 
     def sample_training_ref(self, scene: mi.Scene, sampler: mi.Sampler, ray: mi.Ray3f, depth: mi.UInt32):
         w, h = list(scene.sensors()[0].film().size())
@@ -434,9 +462,9 @@ class RHSIntegrator(ADIntegrator):
                 # ADIntegrator.render() wraps sample() in dr.suspend_grad(),
                 # which suppresses DrJIT AD. We must resume it explicitly.
                 with dr.resume_grad():
-                    vapl_light, si = self.sample_training_drjit(scene, sampler, ray, depth)
+                    vapl_light, gt_light, si = self.sample_training_drjit(scene, sampler, ray, depth)
 
-                    loss = compute_drjit_loss(vapl_light, self.gt_light)
+                    loss = compute_drjit_loss(vapl_light, gt_light)
 
                     # Mixed-precision: scale loss before backward, then scaled step
                     dr.backward(self.model.scaler.scale(loss))
@@ -447,8 +475,8 @@ class RHSIntegrator(ADIntegrator):
                 return vapl_light, si.is_valid(), [], mi.Spectrum(0)
             else:
                 # PyTorch training path (original)
-                vapl_light, si = self.sample_training(scene, sampler, ray, depth)
-                GT_Light = torch.from_numpy(self.gt_light.numpy()).to("cuda").T
+                vapl_light, gt_light, si = self.sample_training(scene, sampler, ray, depth)
+                GT_Light = torch.from_numpy(gt_light.numpy()).to("cuda").T
 
                 loss : torch.Tensor = self.loss_function(vapl_light, GT_Light, None)
                 self.losses.append(loss.detach().cpu())
