@@ -302,28 +302,18 @@ class vapl_grid_mlp_drjit(vapl_grid_drjit):
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
 
+        self.mlp = dr.nn.Sequential(
+            dr.nn.Linear(input_dim, hidden_dim),
+            dr.nn.ReLU(),
+            dr.nn.Linear(hidden_dim, hidden_dim),
+            dr.nn.ReLU(),
+            dr.nn.Linear(hidden_dim, feature_dim),
+        )
+        self.mlp = self.mlp.alloc(dr.cuda.ad.TensorXf16, input_dim)
+        self.mlp_weights, self.mlp = dr.nn.pack(self.mlp, layout='training')
+
+        self.opt['mlp'] = mi.Float(self.mlp_weights)
         self.opt['level_embed'] = mi.Float(dr.zeros(mi.Float, n_levels * level_embed_dim))
-        self.opt['w1'] = mi.Float(np.random.normal(0, 0.01, input_dim * hidden_dim).astype(np.float32))
-        self.opt['b1'] = mi.Float(dr.zeros(mi.Float, hidden_dim))
-        self.opt['w2'] = mi.Float(np.random.normal(0, 0.01, hidden_dim * hidden_dim).astype(np.float32))
-        self.opt['b2'] = mi.Float(dr.zeros(mi.Float, hidden_dim))
-        self.opt['w3'] = mi.Float(np.random.normal(0, 1e-4, hidden_dim * feature_dim).astype(np.float32))
-        self.opt['b3'] = mi.Float(dr.zeros(mi.Float, feature_dim))
-
-    def linear(self, x_list, weight, bias, in_dim, out_dim):
-        n = dr.width(x_list[0])
-        result = []
-        for o in range(out_dim):
-            acc = dr.gather(mi.Float, bias, dr.full(mi.UInt32, o, n))
-            for i in range(in_dim):
-                w_idx = o * in_dim + i
-                w_val = dr.gather(mi.Float, weight, dr.full(mi.UInt32, w_idx, n))
-                acc = acc + w_val * x_list[i]
-            result.append(acc)
-        return result
-
-    def relu(self, x_list):
-        return [dr.maximum(x, 0.0) for x in x_list]
 
     def get_level_embedding(self, level_idx, n, level_embed_params):
         result = []
@@ -351,13 +341,8 @@ class vapl_grid_mlp_drjit(vapl_grid_drjit):
 
         g_levels, v_levels = self.query_grids(normalized)
 
+        self.mlp_weights[:] = Float16(self.opt['mlp'])
         level_embed = self.opt['level_embed']
-        w1 = self.opt['w1']
-        b1 = self.opt['b1']
-        w2 = self.opt['w2']
-        b2 = self.opt['b2']
-        w3 = self.opt['w3']
-        b3 = self.opt['b3']
 
         gaussians_list = []
         vmfs_list = []
@@ -365,11 +350,11 @@ class vapl_grid_mlp_drjit(vapl_grid_drjit):
         for level, (g_cols, v_cols) in enumerate(zip(g_levels, v_levels)):
             combined = list(g_cols) + list(v_cols)
             level_emb = self.get_level_embedding(level, n, level_embed)
-            mlp_input = combined + level_emb
 
-            h1 = self.relu(self.linear(mlp_input, w1, b1, self.input_dim, self.hidden_dim))
-            h2 = self.relu(self.linear(h1, w2, b2, self.hidden_dim, self.hidden_dim))
-            correction = self.linear(h2, w3, b3, self.hidden_dim, self.feature_dim)
+            mlp_input_f16 = [Float16(f) for f in combined + level_emb]
+            cv_in = dr.nn.CoopVec(*mlp_input_f16)
+            cv_out = self.mlp(cv_in)
+            correction = [mi.Float(f) for f in list(cv_out)]
 
             refined = [c + corr for c, corr in zip(combined, correction)]
 
