@@ -2,7 +2,7 @@ import drjit as dr
 import mitsuba as mi
 mi.set_variant("cuda_ad_rgb")
 
-from drjit.auto.ad import Float16
+from drjit.auto.ad import Float16, TensorXf16
 from drjit.hashgrid import HashGridEncoding
 
 import math
@@ -340,26 +340,28 @@ class vapl_grid_mlp_drjit(vapl_grid_drjit):
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
 
-        self.mlp = dr.nn.Sequential(
+        # Build MLP using DrJIT nn module (tensor-core accelerated matvec)
+        mlp_structure = dr.nn.Sequential(
             dr.nn.Linear(input_dim, hidden_dim),
             dr.nn.ReLU(),
             dr.nn.Linear(hidden_dim, hidden_dim),
             dr.nn.ReLU(),
             dr.nn.Linear(hidden_dim, feature_dim),
         )
-        self.mlp = self.mlp.alloc(dr.cuda.ad.TensorXf16, input_dim)
-        self.mlp_weights, self.mlp = dr.nn.pack(self.mlp, layout='training')
+        mlp_alloc = mlp_structure.alloc(TensorXf16, input_dim)
 
-        self.opt['mlp'] = mi.Float(self.mlp_weights)
+        # Scale last layer near zero for residual identity initialization
+        last_layer = mlp_alloc.layers[4]
+        last_layer.weights = TensorXf16(last_layer.weights * 0.01)
+
+        # Pack into optimal GPU layout for evaluation
+        self.mlp_coeffs, self.mlp = dr.nn.pack(mlp_alloc, layout='training')
+
+        # Store packed coefficients in optimizer (Float32 for precision)
+        self.opt['mlp'] = mi.Float(self.mlp_coeffs.array)
+
+        # Trainable level embeddings
         self.opt['level_embed'] = mi.Float(dr.zeros(mi.Float, n_levels * level_embed_dim))
-
-    def get_level_embedding(self, level_idx, n, level_embed_params):
-        result = []
-        for d in range(self.level_embed_dim):
-            flat_idx = level_idx * self.level_embed_dim + d
-            val = dr.gather(mi.Float, level_embed_params, dr.full(mi.UInt32, flat_idx, n))
-            result.append(val)
-        return result
 
     def __call__(self, si_or_pos):
         if isinstance(si_or_pos, mi.SurfaceInteraction3f):
@@ -379,7 +381,9 @@ class vapl_grid_mlp_drjit(vapl_grid_drjit):
 
         g_levels, v_levels = self.query_grids(normalized)
 
-        self.mlp_weights[:] = Float16(self.opt['mlp'])
+        # Sync MLP weights from optimizer (creates AD connection for backward)
+        self.mlp_coeffs.array[:] = Float16(self.opt['mlp'])
+
         level_embed = self.opt['level_embed']
 
         gaussians_list = []
@@ -387,10 +391,19 @@ class vapl_grid_mlp_drjit(vapl_grid_drjit):
 
         for level, (g_cols, v_cols) in enumerate(zip(g_levels, v_levels)):
             combined = list(g_cols) + list(v_cols)
-            level_emb = self.get_level_embedding(level, n, level_embed)
 
-            mlp_input_f16 = [Float16(f) for f in combined + level_emb]
-            cv_in = dr.nn.CoopVec(*mlp_input_f16)
+            # Level embedding (broadcast scalar to width n)
+            level_emb = []
+            for d in range(self.level_embed_dim):
+                flat_idx = level * self.level_embed_dim + d
+                val = dr.gather(mi.Float, level_embed, dr.full(mi.UInt32, flat_idx, n))
+                level_emb.append(val)
+
+            mlp_input = combined + level_emb
+
+            # Forward through packed MLP (single fused matvec per layer)
+            cv_in = dr.nn.CoopVec(*mlp_input)
+            cv_in = dr.nn.cast(cv_in, Float16)
             cv_out = self.mlp(cv_in)
             correction = [mi.Float(f) for f in list(cv_out)]
 
