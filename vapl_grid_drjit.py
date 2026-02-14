@@ -381,18 +381,31 @@ class vapl_grid_mlp_drjit(vapl_grid_drjit):
 
         g_levels, v_levels = self.query_grids(normalized)
 
+        # Evaluate raw grid outputs so their JIT graphs don't compound
+        # with the MLP graph below.
+        for cols in g_levels + v_levels:
+            dr.eval(*cols)
+
         # Sync MLP weights from optimizer (creates AD connection for backward)
         self.mlp_coeffs.array[:] = Float16(self.opt['mlp'])
 
         level_embed = self.opt['level_embed']
 
-        gaussians_list = []
-        vmfs_list = []
+        # --- Batch all levels into a single MLP call ---
+        # Running the MLP once with n*n_levels inputs instead of n_levels
+        # separate calls reduces the AD tape from n_levels backward MLP
+        # passes to just one, which is the main bottleneck.
+        n_levels = len(g_levels)
+        total_n = n * n_levels
 
+        # Build batched input: concatenate features from all levels
+        batched_features = [dr.empty(mi.Float, total_n) for _ in range(self.input_dim)]
+
+        all_combined = []  # keep originals for residual connection
         for level, (g_cols, v_cols) in enumerate(zip(g_levels, v_levels)):
             combined = list(g_cols) + list(v_cols)
+            all_combined.append(combined)
 
-            # Level embedding (broadcast scalar to width n)
             level_emb = []
             for d in range(self.level_embed_dim):
                 flat_idx = level * self.level_embed_dim + d
@@ -400,13 +413,26 @@ class vapl_grid_mlp_drjit(vapl_grid_drjit):
                 level_emb.append(val)
 
             mlp_input = combined + level_emb
+            idx = dr.arange(mi.UInt32, n) + level * n
+            for i, feat in enumerate(mlp_input):
+                dr.scatter(batched_features[i], feat, idx)
 
-            # Forward through packed MLP (single fused matvec per layer)
-            cv_in = dr.nn.CoopVec(*mlp_input)
-            cv_in = dr.nn.cast(cv_in, Float16)
-            cv_out = self.mlp(cv_in)
-            correction = [mi.Float(f) for f in list(cv_out)]
+        # Single MLP forward for all levels at once
+        cv_in = dr.nn.CoopVec(*batched_features)
+        cv_in = dr.nn.cast(cv_in, Float16)
+        cv_out = self.mlp(cv_in)
+        corrections_all = [mi.Float(f) for f in list(cv_out)]
+        dr.eval(*corrections_all)
 
+        # Split corrections back per level and apply residual + encoding
+        gaussians_list = []
+        vmfs_list = []
+
+        for level in range(n_levels):
+            idx = dr.arange(mi.UInt32, n) + level * n
+            correction = [dr.gather(mi.Float, c, idx) for c in corrections_all]
+
+            combined = all_combined[level]
             refined = [c + corr for c, corr in zip(combined, correction)]
 
             g_refined = refined[:self.num_param_per_gaussian]
@@ -414,6 +440,9 @@ class vapl_grid_mlp_drjit(vapl_grid_drjit):
 
             mean, variance = self.encoding_gaussian(g_refined)
             sharpness, axis, amplitude = self.encoding_vmf(v_refined)
+
+            dr.eval(mean, variance, sharpness, axis, amplitude)
+
             gaussians_list.append((mean, variance))
             vmfs_list.append((sharpness, axis, amplitude))
 
