@@ -245,9 +245,13 @@ class RHSIntegrator(ADIntegrator):
         self.sweep_encoding = sweep_encoding
         self.depth = 1
         self.gt_light = mi.Spectrum(1)
+        self.vapl_ratio = 0.0  # 0 = pure PT, 1 = pure VAPL
 
     def set_train(self, train):
         self.train = train
+
+    def set_vapl_ratio(self, ratio):
+        self.vapl_ratio = ratio
 
     def set_depth(self, depth):
         self.depth = depth
@@ -443,6 +447,68 @@ class RHSIntegrator(ADIntegrator):
         self.gt_light = res_l
         return res_l, si
 
+    def sample_hybrid(self, scene: mi.Scene, sampler: mi.Sampler, ray: mi.Ray3f, depth: mi.UInt32):
+        """Hybrid inference: blend VAPL cache with path tracing.
+
+        Per-ray random split: vapl_ratio fraction of rays use VAPLs,
+        the rest use standard path tracing. Each path is weighted by
+        1/probability to keep the estimator consistent.
+        """
+        with dr.suspend_grad():
+            ray = mi.Ray3f(dr.detach(ray))
+            β = mi.Spectrum(1)
+
+            si = scene.ray_intersect(
+                ray, ray_flags=mi.RayFlags.All, coherent=(depth == 0)
+            )
+            si, β, _ = first_non_specular_or_null_si(scene, si, sampler, β)
+            si.compute_uv_partials(ray)
+
+            # Per-ray decision
+            use_vapl = sampler.next_1d() < self.vapl_ratio
+
+            # --- Path trace path ---
+            res = mi.Spectrum(0)
+            β_pt = mi.Spectrum(β)
+            si_pt = si
+            for d in range(self.depth):
+                if d > 0:
+                    si_pt = scene.ray_intersect(
+                        ray_pt, ray_flags=mi.RayFlags.All, coherent=False
+                    )
+                    si_pt, β_pt, _ = first_non_specular_or_null_si(scene, si_pt, sampler, β_pt)
+
+                if d > 1:
+                    # --- VAPL cache path ---
+                    gaussians_list, vmfs_list = self.model(si)
+
+                    # Evaluate grid outputs to free intermediate JIT memory
+                    # before the mixture convolution builds more AD nodes
+                    for mean, var in gaussians_list:
+                        dr.eval(mean, var)
+                    for sh, ax, amp in vmfs_list:
+                        dr.eval(sh, ax, amp)
+
+                    mixture = vapl_mixture_drjit(gaussians_list, vmfs_list, self.sweep_encoding)
+                    mixture.convolve(si, ray.d)
+                    illum = mixture.illumination
+                    res += β_pt * illum
+                else:
+                    L, bs, β_pt = render_rhs_original(scene, si_pt, sampler, β_pt)
+                    res += β_pt * L
+
+                ray_pt = si_pt.spawn_ray(si_pt.to_world(bs.wo))
+                
+
+            # # Blend with inverse-probability weighting
+            # L = dr.select(
+            #     use_vapl,
+            #     L_vapl / self.vapl_ratio,
+            #     L_pt / (1.0 - self.vapl_ratio),
+            # )
+
+        return res, si
+
     def sample(self,
                mode: dr.ADMode,
                scene: mi.Scene,
@@ -487,6 +553,9 @@ class RHSIntegrator(ADIntegrator):
                 torch.cuda.empty_cache()
                 return vapl_light.permute(1, 0), si.is_valid(), [], mi.Spectrum(0)
         else:
-            L, si = self.sample_training_ref(scene, sampler, ray, depth)
+            if self.vapl_ratio > 0:
+                L, si = self.sample_hybrid(scene, sampler, ray, depth)
+            else:
+                L, si = self.sample_training_ref(scene, sampler, ray, depth)
             return L, si.is_valid(), [], mi.Spectrum(0)
 

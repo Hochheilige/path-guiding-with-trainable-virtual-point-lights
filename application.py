@@ -122,6 +122,24 @@ class Application:
             image = mi.render(self.scene, spp=self.config.spp, integrator=self.integrator)
             self.render(epoch, image)
 
+        self.integrator.set_train(False)
+        self.integrator.set_vapl_ratio(0.0)
+        image = mi.render(self.scene, spp=self.config.spp, integrator=self.integrator)
+        fig, ax = plt.subplots()
+        ax.imshow(np.clip(image ** (1.0 / 2.2), 0, 1))
+        ax.axis("off")
+        ax.set_title(f"PT")
+        plt.show()
+
+        self.integrator.set_vapl_ratio(0.95)
+        image = mi.render(self.scene, spp=self.config.spp, integrator=self.integrator)
+        fig, ax = plt.subplots()
+        ax.imshow(np.clip(image ** (1.0 / 2.2), 0, 1))
+        ax.axis("off")
+        ax.set_title(f"PT + VPL")
+        plt.show()
+
+
         if self.config.mode == "wandb":
             wandb.finish()
 
