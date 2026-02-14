@@ -366,7 +366,9 @@ class RHSIntegrator(ADIntegrator):
         mixture = vapl_mixture(gaussians, vmfs, self.sweep_encoding)
         mixture.convolve(si, ray.d)
 
-        vapl_l = mixture.illumination
+        Le = si.emitter(scene).eval(si)
+        Le_torch = Le.torch().permute(1, 0)
+        vapl_l = mixture.illumination + Le_torch
 
         return vapl_l, gt_light, si
 
@@ -409,7 +411,12 @@ class RHSIntegrator(ADIntegrator):
         mixture = vapl_mixture_drjit(gaussians_list, vmfs_list, self.sweep_encoding)
         mixture.convolve(si, ray.d)
 
-        return mixture.illumination, gt_light, si
+        # Add direct emission so emitter surfaces aren't forced to zero.
+        # Le is constant w.r.t. grid params — no effect on backward pass,
+        # but removes impossible gradients at emitter surfaces.
+        Le = si.emitter(scene).eval(si)
+
+        return mixture.illumination + Le, gt_light, si
 
     def sample_training_ref(self, scene: mi.Scene, sampler: mi.Sampler, ray: mi.Ray3f, depth: mi.UInt32):
         w, h = list(scene.sensors()[0].film().size())
