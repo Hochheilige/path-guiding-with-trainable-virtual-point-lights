@@ -381,8 +381,7 @@ class vapl_grid_mlp_drjit(vapl_grid_drjit):
 
         g_levels, v_levels = self.query_grids(normalized)
 
-        # Evaluate raw grid outputs so their JIT graphs don't compound
-        # with the MLP graph below.
+        # Evaluate all raw grid outputs upfront
         for cols in g_levels + v_levels:
             dr.eval(*cols)
 
@@ -392,14 +391,14 @@ class vapl_grid_mlp_drjit(vapl_grid_drjit):
         level_embed = self.opt['level_embed']
 
         # --- Batch all levels into a single MLP call ---
-        # Running the MLP once with n*n_levels inputs instead of n_levels
-        # separate calls reduces the AD tape from n_levels backward MLP
-        # passes to just one, which is the main bottleneck.
+        # With n_levels separate MLP calls, dr.backward() must compile
+        # n_levels separate backward MLP kernels which gets too slow at n_levels>=4.
+        # Batching into one call means one forward + one backward MLP kernel.
         n_levels = len(g_levels)
         total_n = n * n_levels
 
         # Build batched input: concatenate features from all levels
-        batched_features = [dr.empty(mi.Float, total_n) for _ in range(self.input_dim)]
+        batched_features = [dr.zeros(mi.Float, total_n) for _ in range(self.input_dim)]
 
         all_combined = []  # keep originals for residual connection
         for level, (g_cols, v_cols) in enumerate(zip(g_levels, v_levels)):
@@ -416,6 +415,9 @@ class vapl_grid_mlp_drjit(vapl_grid_drjit):
             idx = dr.arange(mi.UInt32, n) + level * n
             for i, feat in enumerate(mlp_input):
                 dr.scatter(batched_features[i], feat, idx)
+
+        # Materialize the batched buffer before the MLP
+        dr.eval(*batched_features)
 
         # Single MLP forward for all levels at once
         cv_in = dr.nn.CoopVec(*batched_features)
