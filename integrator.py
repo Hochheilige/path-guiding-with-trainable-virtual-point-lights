@@ -135,6 +135,10 @@ def render_rhs_original(scene, si, sampler, β):
 
     return L, bsdf_sample, β*bsdf_weight
 
+# =============================================================================
+# Loss functions — Torch
+# =============================================================================
+
 class Loss():
     def __init__(self, loss_fn):
         self.loss_fn = loss_fn
@@ -206,42 +210,134 @@ def relativeL2_luminance_tiny_cuda_nn(pred, target, pdf=None):
 
     return loss_scale * loss.mean()
 
-
-def compute_drjit_loss(pred, target):
-    """Relative L2 luminance loss computed entirely in DrJIT.
-
-    Args:
-        pred: mi.Color3f — predicted illumination
-        target: mi.Spectrum — ground truth from path tracing
-    Returns:
-        mi.Float — scalar loss value
-    """
-    eps = 1e-2
-    # luminance of prediction (detached for denominator)
-    pred_d = dr.detach(pred)
-    luminance = 0.2126 * pred_d.x + 0.7152 * pred_d.y + 0.0722 * pred_d.z
-    denom = luminance * luminance + eps
-
+def torch_mse(pred, target):
     diff = pred - target
-    sq_error = dr.squared_norm(diff)
+    loss = (diff ** 2)
+    valid = torch.isfinite(loss)
+    if not torch.all(valid):
+        loss = loss[valid]
+    if loss.numel() == 0:
+        return torch.tensor(0.0, device=pred.device, requires_grad=True)
+    return loss.mean()
 
-    loss_per_ray = sq_error / denom
+def torch_log_relative(pred, target):
+    """Log-space loss — compresses dynamic range so dim indirect light
+    contributes as much as bright direct light."""
+    eps = 1e-4
+    log_pred = torch.log1p(pred.clamp(min=0) / eps)
+    log_target = torch.log1p(target.clamp(min=0) / eps)
+    loss = (log_pred - log_target) ** 2
+    valid = torch.isfinite(loss)
+    if not torch.all(valid):
+        loss = loss[valid]
+    if loss.numel() == 0:
+        return torch.tensor(0.0, device=pred.device, requires_grad=True)
+    return loss.mean()
 
-    # Filter out non-finite values
-    valid = dr.isfinite(loss_per_ray)
-    loss_per_ray = dr.select(valid, loss_per_ray, mi.Float(0.0))
+def torch_smape(pred, target):
+    """Symmetric Mean Absolute Percentage Error — balanced for both
+    bright and dim regions, no luminance denominator bias."""
+    eps = 1e-2
+    diff = torch.abs(pred - target)
+    denom = torch.abs(pred.detach()) + torch.abs(target) + eps
+    loss = diff / denom
+    valid = torch.isfinite(loss)
+    if not torch.all(valid):
+        loss = loss[valid]
+    if loss.numel() == 0:
+        return torch.tensor(0.0, device=pred.device, requires_grad=True)
+    return loss.mean()
 
-    n = mi.Float(dr.width(loss_per_ray))
-    return dr.sum(loss_per_ray) / dr.maximum(n, mi.Float(1.0))
+
+# =============================================================================
+# Loss functions — DrJIT
+# =============================================================================
+
+class DrJITLoss():
+    """Unified loss class for the DrJIT training path.
+
+    Usage:
+        loss_fn = DrJITLoss("relative_l2")   # or "mse", "log_relative", "smape"
+        loss = loss_fn(pred, target)
+    """
+    LOSSES = {
+        "relative_l2": "_relative_l2",
+        "mse": "_mse",
+        "log_relative": "_log_relative",
+        "smape": "_smape",
+    }
+
+    def __init__(self, name="relative_l2"):
+        if name not in self.LOSSES:
+            raise ValueError(f"Unknown loss '{name}'. Choose from: {list(self.LOSSES.keys())}")
+        self.name = name
+        self._fn = getattr(self, self.LOSSES[name])
+
+    def __call__(self, pred, target):
+        return self._fn(pred, target)
+
+    @staticmethod
+    def _filter(loss_per_ray):
+        valid = dr.isfinite(loss_per_ray)
+        loss_per_ray = dr.select(valid, loss_per_ray, mi.Float(0.0))
+        n = mi.Float(dr.width(loss_per_ray))
+        return dr.sum(loss_per_ray) / dr.maximum(n, mi.Float(1.0))
+
+    @staticmethod
+    def _relative_l2(pred, target):
+        """Relative L2 luminance loss (original)."""
+        eps = 1e-2
+        pred_d = dr.detach(pred)
+        luminance = 0.2126 * pred_d.x + 0.7152 * pred_d.y + 0.0722 * pred_d.z
+        denom = luminance * luminance + eps
+        sq_error = dr.squared_norm(pred - target)
+        return DrJITLoss._filter(sq_error / denom)
+
+    @staticmethod
+    def _mse(pred, target):
+        """Plain mean squared error."""
+        sq_error = dr.squared_norm(pred - target)
+        return DrJITLoss._filter(sq_error)
+
+    @staticmethod
+    def _log_relative(pred, target):
+        """Log-space loss — compresses dynamic range so dim indirect light
+        contributes as much as bright direct light."""
+        eps = 1e-4
+        log_pred = dr.log(1.0 + dr.maximum(pred, mi.Spectrum(0)) / eps)
+        log_target = dr.log(1.0 + dr.maximum(target, mi.Spectrum(0)) / eps)
+        diff = log_pred - log_target
+        sq_error = dr.squared_norm(diff)
+        return DrJITLoss._filter(sq_error)
+
+    @staticmethod
+    def _smape(pred, target):
+        """Symmetric Mean Absolute Percentage Error — balanced for both
+        bright and dim regions."""
+        eps = 1e-2
+        pred_d = dr.detach(pred)
+        diff = dr.abs(pred - target)
+        denom_r = dr.abs(pred_d.x) + dr.abs(target.x) + eps
+        denom_g = dr.abs(pred_d.y) + dr.abs(target.y) + eps
+        denom_b = dr.abs(pred_d.z) + dr.abs(target.z) + eps
+        loss_per_ray = diff.x / denom_r + diff.y / denom_g + diff.z / denom_b
+        return DrJITLoss._filter(loss_per_ray)
+
+
+# Legacy alias so existing code keeps working
+def compute_drjit_loss(pred, target):
+    return DrJITLoss._relative_l2(pred, target)
 
 
 class RHSIntegrator(ADIntegrator):
-    def __init__(self, model, loss_function : Loss, train, sweep_encoding = None, props=mi.Properties()):
+    def __init__(self, model, loss_function : Loss, train, sweep_encoding = None,
+                 drjit_loss_name="relative_l2", props=mi.Properties()):
         super().__init__(props)
         self.train = train
         self.model = model
         self.losses = []
-        self.loss_function = loss_function
+        self.loss_function = loss_function              # torch path
+        self.drjit_loss_function = DrJITLoss(drjit_loss_name)  # drjit path
         self.sweep_encoding = sweep_encoding
         self.depth = 1
         self.gt_light = mi.Spectrum(1)
@@ -478,31 +574,34 @@ class RHSIntegrator(ADIntegrator):
             res = mi.Spectrum(0)
             β_pt = mi.Spectrum(β)
             si_pt = si
-            for d in range(self.depth):
+            for d in range(2):
                 if d > 0:
                     si_pt = scene.ray_intersect(
                         ray_pt, ray_flags=mi.RayFlags.All, coherent=False
                     )
                     si_pt, β_pt, _ = first_non_specular_or_null_si(scene, si_pt, sampler, β_pt)
 
-                if d > 1:
+                if d >= 1:
                     # --- VAPL cache path ---
-                    gaussians_list, vmfs_list = self.model(si)
+                    active_cache = si_pt.is_valid()
+                    gaussians_list, vmfs_list = self.model(si_pt)
 
-                    # Evaluate grid outputs to free intermediate JIT memory
-                    # before the mixture convolution builds more AD nodes
                     for mean, var in gaussians_list:
                         dr.eval(mean, var)
                     for sh, ax, amp in vmfs_list:
                         dr.eval(sh, ax, amp)
 
                     mixture = vapl_mixture_drjit(gaussians_list, vmfs_list, self.sweep_encoding)
-                    mixture.convolve(si, ray.d)
-                    illum = mixture.illumination
-                    res += β_pt * illum
+                    mixture.convolve(si_pt, ray_pt.d)
+                    Le_cache = si.emitter(scene).eval(si)
+                    illum = mixture.illumination# + Le_cache
+                    # Only add VAPL contribution where the ray actually hit geometry
+                    res += dr.select(active_cache, β_pt * illum, mi.Spectrum(0))
+                    break
                 else:
+                    # render_rhs_original bakes β_pt into L, so accumulate directly
                     L, bs, β_pt = render_rhs_original(scene, si_pt, sampler, β_pt)
-                    res += β_pt * L
+                    res += L
 
                 ray_pt = si_pt.spawn_ray(si_pt.to_world(bs.wo))
                 
@@ -537,7 +636,7 @@ class RHSIntegrator(ADIntegrator):
                 with dr.resume_grad():
                     vapl_light, gt_light, si = self.sample_training_drjit(scene, sampler, ray, depth)
 
-                    loss = compute_drjit_loss(vapl_light, gt_light)
+                    loss = self.drjit_loss_function(vapl_light, gt_light)
 
                     # Mixed-precision: scale loss before backward, then scaled step
                     dr.backward(self.model.scaler.scale(loss))
