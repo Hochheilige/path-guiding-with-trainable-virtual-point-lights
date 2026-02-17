@@ -231,7 +231,7 @@ class vapl_grid_drjit:
 
         normalized = self.normalize_pos(pos)
 
-        if self.config.grid.accumulate_gaussians and self.config.grid.n_levels == 1:
+        if self.config.grid.accumulate_gaussians:
             return self.query_with_neighbours(normalized)
 
         g_levels, v_levels = self.query_grids(normalized)
@@ -247,35 +247,50 @@ class vapl_grid_drjit:
         return gaussians_list, vmfs_list
 
     def query_with_neighbours(self, normalized_pos):
-        block_size = 1.0 / self.config.grid.resolution
+        """Query grid at center + random neighbours for each level.
 
-        g_levels, v_levels = self.query_grids(normalized_pos)
-        g_cols = g_levels[0]
-        v_cols = v_levels[0]
-
-        mean, variance = self.encoding_gaussian(g_cols)
-        sharpness, axis, amplitude = self.encoding_vmf(v_cols)
-        gaussians_list = [(mean, variance)]
-        vmfs_list = [(sharpness, axis, amplitude)]
-
-        offsets = [
-            mi.Vector3f(dx, dy, dz) * block_size
-            for dx in [-1, 0, 1]
-            for dy in [-1, 0, 1]
-            for dz in [-1, 0, 1]
-            if not (dx == 0 and dy == 0 and dz == 0)
-        ]
-
+        For n_levels == 1: queries center and neighbours at base resolution.
+        For n_levels > 1: queries center at all levels (returns one VAPL per level),
+            then for each level queries neighbours at that level's block size.
+        """
+        base_res = self.config.grid.resolution
         num_to_sample = self.config.grid.num_neighbours_to_sample
-        chosen = random.sample(offsets, min(num_to_sample, len(offsets)))
 
-        for offset in chosen:
-            npos = normalized_pos + offset
-            gl, vl = self.query_grids(npos)
-            m, var = self.encoding_gaussian(gl[0])
-            sh, ax, amp = self.encoding_vmf(vl[0])
-            gaussians_list.append((m, var))
-            vmfs_list.append((sh, ax, amp))
+        # Query center position at all levels
+        g_levels, v_levels = self.query_grids(normalized_pos)
+
+        gaussians_list = []
+        vmfs_list = []
+
+        # Add center VAPLs for each level
+        for g_cols, v_cols in zip(g_levels, v_levels):
+            mean, variance = self.encoding_gaussian(g_cols)
+            sharpness, axis, amplitude = self.encoding_vmf(v_cols)
+            gaussians_list.append((mean, variance))
+            vmfs_list.append((sharpness, axis, amplitude))
+
+        # For each level, query neighbours at that level's resolution
+        for level in range(self.n_levels):
+            resolution = base_res * (2 ** level)
+            block_size = 1.0 / resolution
+
+            offsets = [
+                mi.Vector3f(dx, dy, dz) * block_size
+                for dx in [-1, 0, 1]
+                for dy in [-1, 0, 1]
+                for dz in [-1, 0, 1]
+                if not (dx == 0 and dy == 0 and dz == 0)
+            ]
+
+            chosen = random.sample(offsets, min(num_to_sample, len(offsets)))
+
+            for offset in chosen:
+                npos = normalized_pos + offset
+                gl, vl = self.query_grids(npos)
+                m, var = self.encoding_gaussian(gl[level])
+                sh, ax, amp = self.encoding_vmf(vl[level])
+                gaussians_list.append((m, var))
+                vmfs_list.append((sh, ax, amp))
 
         return gaussians_list, vmfs_list
 
