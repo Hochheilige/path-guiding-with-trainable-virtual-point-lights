@@ -7,9 +7,8 @@ import torch.nn.functional as F
 import tinycudann as tcnn
 torch.autograd.set_detect_anomaly(True)
 
-import numpy as np
-import matplotlib.pyplot as plt
 import random
+
 
 def minmaxnorm(x):
     return (x - x.min()) / (x.max() - x.min())
@@ -35,7 +34,6 @@ encoders = {
     "exp": torch.exp,
     "relu": torch.relu,
     "sigmoid": torch.sigmoid,
-    "relu": torch.relu,
     "tanh" : torch.tanh,
     "softplus": F.softplus,
     "normalize": F.normalize,
@@ -45,6 +43,7 @@ encoders = {
     "tanh-norm": lambda x: 0.5 * (torch.tanh(x) + 1),
     "raw": lambda x: x,
 }
+
 
 class vapl_grid_base(torch.nn.Module):
     def __init__(self, config, bb_min, bb_max):
@@ -80,16 +79,18 @@ class vapl_grid_base(torch.nn.Module):
         self.current_epoch = epoch
 
     @classmethod
-    def create_vapl_grid(cls, config , bb_min, bb_max):
+    def create_vapl_grid(cls, config, bb_min, bb_max):
         if config.grid.layout == "drjit":
-            from vapl_grid_drjit import vapl_grid_drjit
+            from .drjit_grid import vapl_grid_drjit
             return vapl_grid_drjit(config, bb_min, bb_max)
         elif config.grid.layout == "drjit-mlp":
-            from vapl_grid_drjit import vapl_grid_mlp_drjit
+            from .drjit_mlp_grid import vapl_grid_mlp_drjit
             return vapl_grid_mlp_drjit(config, bb_min, bb_max)
         elif config.grid.layout == "mlp":
+            from .torch_grid import vapl_grid_mlp
             return vapl_grid_mlp(config, bb_min, bb_max).cuda()
         else:
+            from .torch_grid import vapl_grid
             return vapl_grid(config, bb_min, bb_max).cuda()
 
     def set_config(self, config):
@@ -128,29 +129,6 @@ class vapl_grid_base(torch.nn.Module):
 
                 gaussians_list.append(gaussians)
                 vmf_list.append(vmf)
-        # else:
-        #     block_size = 1.0 / self.config.grid.resolution
-        #     gaussians_list = [self.gaussian_grid(normalized_pos).to(dtype=torch.float32)]
-        #     vmf_list       = [self.vmf_grid(normalized_pos).to(dtype=torch.float32)]
-
-        #     # Фиксированные смещения только по оси X (влево и вправо)
-        #     neighbor_offsets = [
-        #         torch.tensor([dx, 0, 0], device="cuda") * block_size
-        #         for dx in (-1, 1)
-        #     ]
-
-        #     # Берём ровно num_neighbours_to_sample первых (или всех, если их меньше)
-        #     num = self.config.grid.num_neighbours_to_sample
-        #     fixed_neighbors = neighbor_offsets[:num]
-
-        #     for offset in fixed_neighbors:
-        #         neighbor_pos = normalized_pos + offset
-
-        #         gaussians = self.gaussian_grid(neighbor_pos).to(dtype=torch.float32)
-        #         vmf       = self.vmf_grid(neighbor_pos).to(dtype=torch.float32)
-
-        #         gaussians_list.append(gaussians)
-        #         vmf_list.append(vmf)
 
         return gaussians_list, vmf_list
 
@@ -215,8 +193,8 @@ class vapl_grid_base(torch.nn.Module):
                 axis = encoders[self.config.sweep_config.vmf_axis_encoding](vmf[:, 1:4])
                 amplitude = encoders[self.config.sweep_config.vmf_amplitude_encoding](vmf[:, 4:7])
 
-            gaussians = torch.cat([mean, variance], dim = 1)
-            vmf = torch.cat([sharpness, axis, amplitude], dim = 1)
+            gaussians = torch.cat([mean, variance], dim=1)
+            vmf = torch.cat([sharpness, axis, amplitude], dim=1)
 
             return gaussians, vmf
 
@@ -230,7 +208,6 @@ class vapl_grid_base(torch.nn.Module):
             return encoded_gaussians, encoded_vmf
         else:
             return process_tensors(gaussians, vmf)
-
 
     def encoding(self, gaussians, vmf):
         def process_tensors(gaussians, vmf):
@@ -324,145 +301,3 @@ class vapl_grid_base(torch.nn.Module):
                 vmf_list.append(encoded_vmf[level])
 
             return gaussians_list, vmf_list
-
-class vapl_grid(vapl_grid_base):
-    def __init__(self, config, bb_min, bb_max):
-        super().__init__(config, bb_min, bb_max)
-
-        self.optimizer = torch.optim.Adam(
-            list(self.gaussian_grid.parameters()) + list(self.vmf_grid.parameters()),
-            lr=self.learning_rate
-        )
-
-        # It is possible to change learning rate during training
-        #torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.95)
-
-    def forward(self, input):
-        gaussians, vmf = self.get_vapls(input)
-        return self.encode(gaussians, vmf)
-
-class vapl_grid_mlp(vapl_grid_base):
-    def __init__(self, config, bb_min, bb_max):
-        super().__init__(config, bb_min, bb_max)
-
-        n_levels = config.grid.n_levels if config.grid.n_levels > 1 else self.config.grid.num_neighbours_to_sample + 1
-
-        # gaussian(4) + vmf(8) = 12 input features per level
-        feature_dim = self.num_param_per_gaussian + self.num_param_per_vmf
-        # shared MLP takes features + level embedding
-        level_embed_dim = 4
-        input_dim = feature_dim + level_embed_dim
-        hidden_dim = 32
-
-        self.level_embedding = torch.nn.Embedding(n_levels, level_embed_dim)
-
-        # Shared MLP: input -> hidden -> hidden -> residual correction
-        self.mlp = torch.nn.Sequential(
-            torch.nn.Linear(input_dim, hidden_dim),
-            torch.nn.ReLU(),
-            torch.nn.Linear(hidden_dim, hidden_dim),
-            torch.nn.ReLU(),
-            torch.nn.Linear(hidden_dim, feature_dim),
-        )
-
-        # Initialize last layer near zero so residual starts as identity
-        torch.nn.init.zeros_(self.mlp[-1].weight)
-        torch.nn.init.zeros_(self.mlp[-1].bias)
-
-        self.optimizer = torch.optim.Adam(
-            list(self.gaussian_grid.parameters()) +
-            list(self.vmf_grid.parameters()) +
-            list(self.mlp.parameters()) +
-            list(self.level_embedding.parameters()),
-            lr=self.learning_rate
-        )
-
-    def forward(self, input):
-        gaussians_list, vmf_list = self.get_vapls(input)
-
-        output_gaussians_list = []
-        output_vmf_list = []
-
-        for level, (gauss, vmf) in enumerate(zip(gaussians_list, vmf_list)):
-            combined = torch.cat([gauss, vmf], dim=1)
-
-            level_idx = torch.full((combined.shape[0],), level, device=combined.device, dtype=torch.long)
-            level_embed = self.level_embedding(level_idx)
-            mlp_input = torch.cat([combined, level_embed], dim=1)
-
-            # Residual: grid features + learned correction
-            correction = self.mlp(mlp_input)
-            refined = combined + correction
-
-            output_gaussians_list.append(refined[:, :self.num_param_per_gaussian])
-            output_vmf_list.append(refined[:, self.num_param_per_gaussian:])
-
-        return self.encode(output_gaussians_list, output_vmf_list)
-
-
-# helper functions for debug vapl visualization
-def world_to_ndc(scene, batch):
-    """Transforms 3D world coordinates into normalized device coordinates (NDC) using the perspective transformation matrix.
-
-    Args:
-        scene (mi.Scene): Mitsuba 3 scene containing the camera information.
-        batch (array_like): Array of 3D world coordinates.
-
-    Returns:
-        mi.Point3f: Array of 3D points in NDC.
-    """
-    sensor : mi.Sensor = mi.traverse(scene.sensors()[0])
-    fov = sensor['x_fov']
-    near = sensor['near_clip']
-    far = sensor['far_clip']
-    
-    trafo = mi.ProjectiveTransform4f().perspective(fov, near, far)
-    to_world_inv = sensor['to_world'].inverse()
-    
-    # Convert both to Transform4f
-    proj_tf = mi.Transform4f(trafo.matrix)
-    world_inv_tf = mi.Transform4f(to_world_inv.matrix)
-    combined = proj_tf @ world_inv_tf
-
-    pts = combined @ mi.Point3f(np.array(batch.T))
-    return pts
-
-def ndc_to_pixel(pts, h, w):
-    """Converts points in NDC to pixel coordinates.
-
-    Args:
-        pts (mi.Point2f): Points in NDC.
-        h (float): Height of the image in pixels.
-        w (float): Width of the image in pixels.
-
-    Returns:
-        mi.Point2f: Pixel coordinates of the given points.
-    """
-    hh, hw = h/2, w/2
-    return mi.Point2f(dr.fma(pts.x, -hw, hw), dr.fma(pts.y, -hw, hh))  # not typo
-
-def draw_multi_segments(starts, ends, color):
-    """Draws multiple line segments on a plot.
-
-    Args:
-        starts (mi.Point2f): Starting points of the line segments.
-        ends (mi.Point2f): Ending points of the line segments.
-        color (str): Color of the line segments.
-    """
-    a = np.c_[starts.x, starts.y]
-    b = np.c_[ends.x, ends.y]
-    plt.plot(*np.c_[a, b, a*np.nan].reshape(-1, 2).T, color)
-
-def pix_coord(scene, batch, h, w):
-    """Calculates the pixel coordinates of the given 3D world coordinates.
-
-    Args:
-        scene (mi.Scene): Mitsuba 3 scene containing the camera information.
-        batch (array_like): Array of 3D world coordinates.
-        h (float): Height of the image in pixels.
-        w (float): Width of the image in pixels.
-
-    Returns:
-        mi.Point2f: Pixel coordinates of the given 3D world coordinates.
-    """
-    return ndc_to_pixel(world_to_ndc(scene, batch), h, w)

@@ -8,7 +8,7 @@ class Config(dict):
         self.__dict__ = self
 
 raw_config = {
-    "scene"     : "scenes/country_kitchen/scene.xml", # cornell box, veach_mis
+    "scene"     : "cornell box", # cornell box, veach_mis
     "mode"      : "local",       # local, wandb, sweep
     "wandb_group"  : "default",
     "sweep_config" : None,       # add to use sweep
@@ -29,6 +29,7 @@ raw_config = {
         "stochastic_interpolation":    True,
         "stochastic_std":              0.1,
     },
+    "indirect_only" : True,
     "loss" : "relative_l2",
     # It is also possible to pass optimizer type here
     # but right now I don't see the reason to do that

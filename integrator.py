@@ -7,8 +7,8 @@ import inspect
 import torch
 torch.autograd.set_detect_anomaly(True)
 
-from vapl_utils import vapl_mixture
-from vapl_utils_drjit import vapl_mixture_drjit
+from utils.mixture import vapl_mixture
+from utils.mixture_drjit import vapl_mixture_drjit
 
 # Base idea of integrator is taken from:
 # https://github.com/krafton-ai/neural-radiosity-tutorial-mitsuba3/blob/main/neural_radiosity.ipynb
