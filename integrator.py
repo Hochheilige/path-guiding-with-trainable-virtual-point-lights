@@ -403,17 +403,22 @@ class RHSIntegrator(ADIntegrator):
                                                       max_depth=self.depth, rr_depth=2,
                                                       indirect_only=self.indirect_only)
 
-                    # VAPL prediction at the same si (gradients flow through model)
-                    gaussians_list, vmfs_list = self.model(si)
-                    for mean, var in gaussians_list:
-                        dr.eval(mean, var)
-                    for sh, ax, amp in vmfs_list:
-                        dr.eval(sh, ax, amp)
-                    mixture = vapl_mixture_drjit(gaussians_list, vmfs_list, self.sweep_encoding)
-                    mixture.convolve(si, ray_d.d)
-                    # indirect_only: exclude Le so prediction matches GT (no direct emission)
-                    Le         = mi.Spectrum(0) if self.indirect_only else si.emitter(scene).eval(si)
-                    vapl_light = beta * (mixture.illumination + Le)
+                    # Model prediction at the same si (gradients flow through model)
+                    if getattr(self.model, '_is_nrc', False):
+                        # NRC: model(si, ray) → Color3f indirect radiance directly
+                        vapl_light = beta * self.model(si, ray_d)
+                    else:
+                        # VAPL prediction
+                        gaussians_list, vmfs_list = self.model(si)
+                        for mean, var in gaussians_list:
+                            dr.eval(mean, var)
+                        for sh, ax, amp in vmfs_list:
+                            dr.eval(sh, ax, amp)
+                        mixture = vapl_mixture_drjit(gaussians_list, vmfs_list, self.sweep_encoding)
+                        mixture.convolve(si, ray_d.d)
+                        # indirect_only: exclude Le so prediction matches GT (no direct emission)
+                        Le         = mi.Spectrum(0) if self.indirect_only else si.emitter(scene).eval(si)
+                        vapl_light = beta * (mixture.illumination + Le)
 
                     loss = self.drjit_loss_function(vapl_light, gt_light)
 
@@ -438,13 +443,16 @@ class RHSIntegrator(ADIntegrator):
                 torch.cuda.empty_cache()
                 return vapl_light.permute(1, 0), si.is_valid(), [], mi.Spectrum(0)
         else:
-            # Inference: same path as training GT for consistency
+            # Inference
             ray_d  = mi.Ray3f(dr.detach(ray))
             beta   = mi.Spectrum(1)
             si_raw = scene.ray_intersect(ray_d, ray_flags=mi.RayFlags.All, coherent=(depth == 0))
             si, beta, _ = first_non_specular_or_null_si(scene, si_raw, sampler, beta)
-            L = path_trace_from_si(scene, si, sampler, beta,
-                                   max_depth=self.depth, rr_depth=2,
-                                   indirect_only=self.indirect_only)
+            if getattr(self.model, '_is_nrc', False):
+                L = beta * self.model(si, ray_d)
+            else:
+                L = path_trace_from_si(scene, si, sampler, beta,
+                                       max_depth=self.depth, rr_depth=2,
+                                       indirect_only=self.indirect_only)
             return L, si.is_valid(), [], mi.Spectrum(0)
 

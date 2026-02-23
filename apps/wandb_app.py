@@ -63,13 +63,13 @@ class WandbApp(BaseApp):
             gaussians_list, vmfs_list = self.grid.get_gaussians_for_debug_render()
             h, w = image.shape[0], image.shape[1]
 
-            n_levels = self.config.grid.n_levels
+            gaussians_list = gaussians_list[:self.config.grid.n_levels]
+            vmfs_list = vmfs_list[:self.config.grid.n_levels]
+            n_levels = len(gaussians_list)
             total_plots = n_levels + 1
 
-            gaussians_list = gaussians_list[:n_levels]
-            vmfs_list = vmfs_list[:n_levels]
-
-            fig, axs = plt.subplots(1, total_plots, figsize=(6 * total_plots, 6))
+            fig, axs = plt.subplots(1, total_plots, figsize=(6 * total_plots, 6), squeeze=False)
+            axs = axs[0]
 
             axs[0].imshow(np.clip(image ** (1.0 / 2.2), 0, 1))
             axs[0].axis("off")
