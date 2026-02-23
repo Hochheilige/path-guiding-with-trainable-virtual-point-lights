@@ -448,11 +448,8 @@ class RHSIntegrator(ADIntegrator):
             beta   = mi.Spectrum(1)
             si_raw = scene.ray_intersect(ray_d, ray_flags=mi.RayFlags.All, coherent=(depth == 0))
             si, beta, _ = first_non_specular_or_null_si(scene, si_raw, sampler, beta)
-            if getattr(self.model, '_is_nrc', False):
-                L = beta * self.model(si, ray_d)
-            else:
-                L = path_trace_from_si(scene, si, sampler, beta,
-                                       max_depth=self.depth, rr_depth=2,
-                                       indirect_only=self.indirect_only)
+            L = path_trace_from_si(scene, si, sampler, beta,
+                                   max_depth=self.depth, rr_depth=2,
+                                   indirect_only=self.indirect_only)
             return L, si.is_valid(), [], mi.Spectrum(0)
 
