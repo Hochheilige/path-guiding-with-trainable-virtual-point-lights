@@ -55,15 +55,14 @@ class Application:
             self.train()
 
     def recreate(self):
-        del self.grid
-        del self.integrator
-        del self.scene
+        for attr in ('grid', 'integrator', 'scene'):
+            if hasattr(self, attr):
+                delattr(self, attr)
         gc.collect()
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
         dr.kernel_history_clear()
         dr.flush_malloc_cache()
-        dr.malloc_clear_statistics()
         dr.flush_kernel_cache()
         if self.config.scene == "cornell box":
             # cornell box with specular sphere
