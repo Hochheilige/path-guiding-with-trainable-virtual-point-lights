@@ -139,7 +139,7 @@ class vapl_grid_drjit:
 
         return g_levels, v_levels
 
-    def encoding_gaussian(self, raw_cols):
+    def encoding_gaussian(self, raw_cols, pos=None):
         cfg = self.config.grid
         extent = self.bb_max - self.bb_min
 
@@ -156,6 +156,28 @@ class vapl_grid_drjit:
             mz = raw_cols[2] / eps * 0.5 - 0.5
             mean = mi.Point3f(mx, my, mz)
             mean = mean * extent + self.bb_min
+        elif mean_enc == "tanh-norm":
+            mx = dr_sigmoid(2.0 * raw_cols[0])
+            my = dr_sigmoid(2.0 * raw_cols[1])
+            mz = dr_sigmoid(2.0 * raw_cols[2])
+            mean = mi.Point3f(mx, my, mz)
+            mean = mean * extent + self.bb_min
+        elif mean_enc == "pos-offset":
+            # At init hash features ≈ 0 → sigmoid(0)-0.5=0 → offset=0
+            # so each VAPL starts exactly at the query position (spread across scene).
+            # The hash grid then learns offsets toward actual indirect light sources.
+            off_x = dr_sigmoid(raw_cols[0]) - 0.5
+            off_y = dr_sigmoid(raw_cols[1]) - 0.5
+            off_z = dr_sigmoid(raw_cols[2]) - 0.5
+            if pos is not None:
+                mx = dr.clamp(pos.x + off_x, 0.0, 1.0)
+                my = dr.clamp(pos.y + off_y, 0.0, 1.0)
+                mz = dr.clamp(pos.z + off_z, 0.0, 1.0)
+            else:
+                mx = off_x + 0.5
+                my = off_y + 0.5
+                mz = off_z + 0.5
+            mean = mi.Point3f(mx, my, mz) * extent + self.bb_min
         else:
             mean = mi.Point3f(raw_cols[0], raw_cols[1], raw_cols[2])
             mean = mean * extent + self.bb_min
@@ -239,7 +261,7 @@ class vapl_grid_drjit:
         gaussians_list = []
         vmfs_list = []
         for g_cols, v_cols in zip(g_levels, v_levels):
-            mean, variance = self.encoding_gaussian(g_cols)
+            mean, variance = self.encoding_gaussian(g_cols, normalized)
             sharpness, axis, amplitude = self.encoding_vmf(v_cols)
             gaussians_list.append((mean, variance))
             vmfs_list.append((sharpness, axis, amplitude))
@@ -264,7 +286,7 @@ class vapl_grid_drjit:
 
         # Add center VAPLs for each level
         for g_cols, v_cols in zip(g_levels, v_levels):
-            mean, variance = self.encoding_gaussian(g_cols)
+            mean, variance = self.encoding_gaussian(g_cols, normalized_pos)
             sharpness, axis, amplitude = self.encoding_vmf(v_cols)
             gaussians_list.append((mean, variance))
             vmfs_list.append((sharpness, axis, amplitude))
@@ -287,7 +309,7 @@ class vapl_grid_drjit:
             for offset in chosen:
                 npos = normalized_pos + offset
                 gl, vl = self.query_grids(npos)
-                m, var = self.encoding_gaussian(gl[level])
+                m, var = self.encoding_gaussian(gl[level], npos)
                 sh, ax, amp = self.encoding_vmf(vl[level])
                 gaussians_list.append((m, var))
                 vmfs_list.append((sh, ax, amp))
@@ -455,7 +477,7 @@ class vapl_grid_mlp_drjit(vapl_grid_drjit):
             g_refined = refined[:self.num_param_per_gaussian]
             v_refined = refined[self.num_param_per_gaussian:]
 
-            mean, variance = self.encoding_gaussian(g_refined)
+            mean, variance = self.encoding_gaussian(g_refined, normalized)
             sharpness, axis, amplitude = self.encoding_vmf(v_refined)
 
             dr.eval(mean, variance, sharpness, axis, amplitude)

@@ -42,6 +42,7 @@ encoders = {
     "spherical": spherical,
     "spherical-norm": spherical_norm,
     "eps-norm" : eps_norm,
+    "tanh-norm": lambda x: 0.5 * (torch.tanh(x) + 1),
     "raw": lambda x: x,
 }
 
