@@ -97,7 +97,8 @@ class Application:
         self.integrator = RHSIntegrator(self.grid, self.loss_function, True,
                                         drjit_loss_name=self.config.loss)
         self.integrator.set_depth(self.config.depth)
-        self.integrator.set_config(self.config.sweep_config.vmf_axis_encoding)
+        axis_enc = wandb.config.get('vmf_axis_encoding', self.config.grid.vmf_axis_encoding)
+        self.integrator.set_config(axis_enc)
 
     def train(self):
         if (self.config.mode != "sweep"):
