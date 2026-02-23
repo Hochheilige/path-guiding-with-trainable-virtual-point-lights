@@ -83,6 +83,16 @@ class Application:
         else:
             self.scene : mi.Scene = mi.load_file(self.config.scene)
         self.config.sweep_config = wandb.config
+
+        # Propagate sweep encoding parameters into config.grid so create_vapl_grid sees them
+        grid_encoding_keys = [
+            'gaussian_mean_encoding', 'gaussian_variance_encoding',
+            'vmf_sharpness_encoding', 'vmf_axis_encoding', 'vmf_amplitude_encoding',
+        ]
+        for key in grid_encoding_keys:
+            if key in wandb.config:
+                self.config.grid[key] = wandb.config[key]
+
         self.epoch = self.config.sweep_config.epoch
         self.grid = vapl_grid_base.create_vapl_grid(self.config, self.scene.bbox().min, self.scene.bbox().max)
         self.integrator = RHSIntegrator(self.grid, self.loss_function, True,
