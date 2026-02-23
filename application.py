@@ -33,7 +33,7 @@ class Application:
         self.grid = vapl_grid_base.create_vapl_grid(config, self.scene.bbox().min, self.scene.bbox().max)
         self.loss_function = Loss(relativeL2_luminance_tiny_cuda_nn)
         self.integrator = RHSIntegrator(self.grid, self.loss_function, True,
-                                        drjit_loss_name=config.loss)
+                                        drjit_loss_name=config.loss, indirect_only=True)
         self.integrator.set_depth(self.config.depth)
 
         if config.mode == "wandb":
@@ -123,44 +123,6 @@ class Application:
             self.integrator.epoch = epoch
             image = mi.render(self.scene, spp=self.config.spp, integrator=self.integrator)
             self.render(epoch, image)
-
-        # # cornell box with specular sphere
-        # scene_dict = mi.cornell_box()
-        # scene_dict['sphere'] = {
-        #        'type': 'sphere',
-        #        'radius': 0.4,
-        #        'center': [0, 0.2, 0],
-        #        'bsdf': {
-        #            'type': 'roughconductor',
-        #            'distribution': 'ggx',
-        #            'alpha_u': 0.5,
-        #            'alpha_v': 0.1
-        #        },
-        # }
-        # scene_dict['sensor']['to_world'] = mi.ScalarTransform4f.look_at(
-        #     origin=[0.8, 0.8, 0.8],   # left side
-        #     target=[0.0, 0.0, 0.0],    # look at center
-        #     up=[0, 1, 0]
-        # )
-        # self.scene = mi.load_dict(scene_dict)
-
-        self.integrator.set_train(False)
-        self.integrator.set_vapl_ratio(0.0)
-        image = mi.render(self.scene, spp=self.config.spp, integrator=self.integrator)
-        fig, ax = plt.subplots()
-        ax.imshow(np.clip(image ** (1.0 / 2.2), 0, 1))
-        ax.axis("off")
-        ax.set_title(f"PT")
-        plt.show()
-
-        self.integrator.set_vapl_ratio(0.95)
-        image = mi.render(self.scene, spp=self.config.spp, integrator=self.integrator)
-        fig, ax = plt.subplots()
-        ax.imshow(np.clip(image ** (1.0 / 2.2), 0, 1))
-        ax.axis("off")
-        ax.set_title(f"PT + VPL")
-        plt.show()
-
 
         if self.config.mode == "wandb":
             wandb.finish()

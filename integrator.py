@@ -47,93 +47,85 @@ def first_non_specular_or_null_si(scene, si, sampler, β):
     return si, β, null_face
 
 
-def render_rhs(scene : mi.Scene, si : mi.SurfaceInteraction3f, sampler, β):
+@dr.syntax
+def path_trace_from_si(scene, si, sampler, beta, max_depth=4, rr_depth=2, indirect_only=False):
+    """Multi-bounce path tracer starting from a given surface interaction.
+
+    Implements proper two-sample MIS:
+    - Emitter direction sampling (NEE) weighted against BSDF PDF
+    - BSDF-sampled emitter hits weighted against emitter PDF
+
+    indirect_only=True: skips Le and NEE at depth=0, so only light that
+    has bounced at least once (indirect illumination) is returned.
+    """
     with dr.suspend_grad():
-        # All the stuff from original render_rhs function
         bsdf_ctx = mi.BSDFContext()
-        depth = mi.UInt32(0)
-        L = mi.Spectrum(0)
-        η = mi.Float(1)
-        prev_si = dr.zeros(mi.SurfaceInteraction3f)
-        prev_bsdf_pdf = mi.Float(1.0)
+        L        = mi.Spectrum(0)
+        depth    = mi.UInt32(0)
+
+        # Track the previous BSDF sample to MIS-weight emitter hits correctly.
+        # prev_bsdf_delta=True at depth 0 so the first emitter hit (Le) counts with weight 1.
+        prev_si         = dr.zeros(mi.SurfaceInteraction3f)
+        prev_bsdf_pdf   = mi.Float(1.0)
         prev_bsdf_delta = mi.Bool(True)
 
-        bsdf = si.bsdf()
-        Le = β * si.emitter(scene).eval(si)
+        active = si.is_valid()
 
-        # emitter sampling
-        active_next = si.is_valid()
-        active_em = active_next & mi.has_flag(bsdf.flags(), mi.BSDFFlags.Smooth)
+        while active & (depth < mi.UInt32(max_depth)):
+            bsdf = si.bsdf()
 
-        ds, em_weight = scene.sample_emitter_direction(
-            si, sampler.next_2d(), True, active_em
-        )
-        active_em &= (ds.pdf != 0.0)
+            # --- Emission at current hit, MIS-weighted against emitter sampling ---
+            ds_prev         = mi.DirectionSample3f(scene, si=si, ref=prev_si)
+            em_pdf_for_prev = scene.pdf_emitter_direction(
+                prev_si, ds_prev, ~prev_bsdf_delta & active
+            )
+            mis_bsdf_w = dr.select(
+                prev_bsdf_delta,
+                mi.Float(1.0),
+                mis_weight(prev_bsdf_pdf, em_pdf_for_prev)
+            )
+            Le_contrib = beta * mis_bsdf_w * si.emitter(scene).eval(si)
+            # indirect_only: skip Le at depth=0 (direct emission / first-hit emitter via BSDF)
+            L += dr.select(mi.Bool(not indirect_only) | (depth > mi.UInt32(0)),
+                           Le_contrib, mi.Spectrum(0))
 
-        wo = si.to_local(ds.d)
-        bsdf_value_em, bsdf_pdf_em = bsdf.eval_pdf(bsdf_ctx, si, wo, active_em)
-        mis_em = dr.select(ds.delta, 1, mis_weight(ds.pdf, bsdf_pdf_em))
-        Lr_dir = β * mis_em * bsdf_value_em * em_weight
+            # --- NEE: sample an emitter direction, MIS-weighted against BSDF ---
+            active_em = active & mi.has_flag(bsdf.flags(), mi.BSDFFlags.Smooth)
+            # indirect_only: skip direct NEE at depth=0
+            active_em &= mi.Bool(not indirect_only) | (depth > mi.UInt32(0))
+            ds_em, em_weight = scene.sample_emitter_direction(
+                si, sampler.next_2d(), True, active_em
+            )
+            active_em &= ds_em.pdf != 0.0
+            wo_em = si.to_local(ds_em.d)
+            bsdf_val, bsdf_pdf_em = bsdf.eval_pdf(bsdf_ctx, si, wo_em, active_em)
+            mis_em = dr.select(ds_em.delta, mi.Float(1.0), mis_weight(ds_em.pdf, bsdf_pdf_em))
+            L += dr.select(active_em, beta * mis_em * bsdf_val * em_weight, mi.Spectrum(0))
 
-        # bsdf sampling
-        bsdf_sample, bsdf_weight = bsdf.sample(
-            bsdf_ctx, si, sampler.next_1d(), sampler.next_2d(), active_next
-        )
+            # --- BSDF sampling: choose next direction ---
+            bsdf_sample, bsdf_weight = bsdf.sample(
+                bsdf_ctx, si, sampler.next_1d(), sampler.next_2d(), active
+            )
+            beta *= bsdf_weight
 
-        # update
-        L = L + Le + Lr_dir
+            # --- Russian roulette ---
+            rr_active = active & (depth >= mi.UInt32(rr_depth))
+            q         = dr.minimum(dr.max(beta), mi.Float(0.95))
+            survive   = sampler.next_1d() < q
+            active   &= ~rr_active | survive
+            beta      = dr.select(rr_active & survive, beta / q, beta)
 
-        #η = bsdf_sample.eta
-        β *= bsdf_weight
+            # --- Advance to next intersection ---
+            prev_si         = dr.detach(si, True)
+            prev_bsdf_pdf   = bsdf_sample.pdf
+            prev_bsdf_delta = mi.has_flag(bsdf_sample.sampled_type, mi.BSDFFlags.Delta)
 
-        # prev_si = dr.detach(si, True)
-        # prev_bsdf_pdf = bsdf_sample.pdf
-        # prev_bsdf_delta = mi.has_flag(bsdf_sample.sampled_type, mi.BSDFFlags.Delta)
+            ray_next = si.spawn_ray(si.to_world(bsdf_sample.wo))
+            si       = scene.ray_intersect(ray_next, ray_flags=mi.RayFlags.All, coherent=False)
+            active  &= si.is_valid()
+            depth   += 1
 
-        # si = scene.ray_intersect(ray, ray_flags=mi.RayFlags.All, coherent=True)
-        # ds = mi.DirectionSample3f(scene, si=si, ref=prev_si)
-
-        # mis = mis_weight(
-        #     prev_bsdf_pdf,
-        #     scene.pdf_emitter_direction(prev_si, ds, ~prev_bsdf_delta),
-        # )
-
-        # si, β2, null_face = first_non_specular_or_null_si(scene, si, sampler)
-        # β *= β2
-
-        # L += β * mis * si.emitter(scene).eval(si)
-
-        return L, β
-
-
-def render_rhs_original(scene, si, sampler, β):
-    with dr.suspend_grad():
-        bsdf_ctx = mi.BSDFContext()
-        L = mi.Spectrum(0)
-        bsdf = si.bsdf()
-        Le = β * si.emitter(scene).eval(si)
-
-        # emitter sampling
-        active_next = si.is_valid()
-        active_em = active_next & mi.has_flag(bsdf.flags(), mi.BSDFFlags.Smooth)
-        ds, em_weight = scene.sample_emitter_direction(
-            si, sampler.next_2d(), True, active_em
-        )
-
-        active_em &= (ds.pdf != 0.0)
-        wo = si.to_local(ds.d)
-        bsdf_value_em, bsdf_pdf_em = bsdf.eval_pdf(bsdf_ctx, si, wo, active_em)
-        mis_em = dr.select(ds.delta, 1, mis_weight(ds.pdf, bsdf_pdf_em))
-        Lr_dir = β * mis_em * bsdf_value_em * em_weight
-
-        # bsdf sampling
-        bsdf_sample, bsdf_weight = bsdf.sample(
-            bsdf_ctx, si, sampler.next_1d(), sampler.next_2d(), active_next
-        )
-        # update
-        L = L + Le + Lr_dir
-
-    return L, bsdf_sample, β*bsdf_weight
+        return L
 
 # =============================================================================
 # Loss functions — Torch
@@ -331,7 +323,7 @@ def compute_drjit_loss(pred, target):
 
 class RHSIntegrator(ADIntegrator):
     def __init__(self, model, loss_function : Loss, train, sweep_encoding = None,
-                 drjit_loss_name="relative_l2", props=mi.Properties()):
+                 drjit_loss_name="relative_l2", indirect_only=False, props=mi.Properties()):
         super().__init__(props)
         self.train = train
         self.model = model
@@ -339,92 +331,14 @@ class RHSIntegrator(ADIntegrator):
         self.loss_function = loss_function              # torch path
         self.drjit_loss_function = DrJITLoss(drjit_loss_name)  # drjit path
         self.sweep_encoding = sweep_encoding
+        self.indirect_only = indirect_only
         self.depth = 1
-        self.gt_light = mi.Spectrum(1)
-        self.vapl_ratio = 0.0  # 0 = pure PT, 1 = pure VAPL
 
     def set_train(self, train):
         self.train = train
 
-    def set_vapl_ratio(self, ratio):
-        self.vapl_ratio = ratio
-
     def set_depth(self, depth):
         self.depth = depth
-
-    # Basics for Path-tracing using trained vapls
-    @dr.syntax
-    def sample_using_vapls(self,
-               mode: dr.ADMode,
-               scene: mi.Scene,
-               sampler: mi.Sampler,
-               ray: mi.Ray3f,
-               depth: mi.UInt32,
-               δL,
-               δaovs,
-               state_in,
-               active):
-        w, h = list(scene.sensors()[0].film().size())
-        L = mi.Spectrum(0)
-        β = mi.Spectrum(1)
-
-        ray = mi.Ray3f(dr.detach(ray))
-        max_depth = 4
-        self.losses = []
-        si = None
-
-        for depth in range(max_depth):
-            #print("iteration: ", depth)
-            si = scene.ray_intersect(
-                ray, ray_flags=mi.RayFlags.All, coherent=(depth == 0)
-            )
-
-            # update si and bsdf with the first non-specular ones
-            # LOOKS LIKE this funciton could make things worse because
-            # using it instead of directly use our new direction we would sample BSDF
-            # if original si gives smooth or null surface
-            #si, β, _ = first_non_specular_or_null_si(scene, si, sampler)
-
-            # get the vapl mixture for this intersection
-            gaussians, vmfs = self.model(si)
-            mixture = vapl_mixture(gaussians, vmfs)
-            mixture.sample_vapl(si, ray.d)
-
-            # Calculating new sample direction
-
-            # 1st option - Sample direction from sampled vapl light lobe
-            sampled_dir : torch.Tensor = mixture.sample_from_current_ligth_lobe_vmf()
-            print(sampled_dir)
-
-            # 2nd option - Sample direction according to BSDF x vapl convolution
-            # Specular BSDF - Anisotropic Spherical Gaussian
-            # Diffuse BSDF  - Cosine Lobe
-
-            # FIXME:
-            # Looks like this approach works worse,
-            # but probably because not totally correct previous calculations
-            #sampled_dir :torch.Tensor = mixture.sample_from_current_bsdf_light_lobe_vmf()
-
-            Li, β = render_rhs(scene, si, sampler, β)
-
-            # Use new direction from vapl mixture to generate next ray
-            new_dir = mi.cuda_ad_rgb.Vector3f(sampled_dir)
-            ray = si.spawn_ray(new_dir)
-
-            # L_tensor = torch.from_numpy(Li.numpy()).to("cuda").T
-            # light_from_vapl = mixture.illumination
-
-            # mse_loss_func = torch.nn.MSELoss()
-            # loss = mse_loss_func(light_from_vapl, L_tensor)
-            # self.losses.append(loss.item())
-            # loss.backward()
-            # self.model.sg_optimizer.step()
-            # self.model.vmf_optimizer.step()
-            # self.model.sg_optimizer.zero_grad()
-            # self.model.vmf_optimizer.zero_grad()
-
-            L += Li
-        return L, si
 
     def set_config(self, conf):
         self.sweep_encoding = conf
@@ -442,20 +356,9 @@ class RHSIntegrator(ADIntegrator):
 
         si.compute_uv_partials(ray)
 
-        # Compute ground truth at the same surface interaction
-        with dr.suspend_grad():
-            gt_light = mi.Spectrum(0)
-            β_gt = mi.Spectrum(β)
-            si_gt = si
-            for d in range(self.depth):
-                if d > 0:
-                    si_gt = scene.ray_intersect(
-                        ray_gt, ray_flags=mi.RayFlags.All, coherent=False
-                    )
-                    si_gt, β_gt, _ = first_non_specular_or_null_si(scene, si_gt, sampler, β_gt)
-                L, bs, β_gt = render_rhs_original(scene, si_gt, sampler, β_gt)
-                ray_gt = si_gt.spawn_ray(si_gt.to_world(bs.wo))
-                gt_light += L
+        # Compute ground truth: full multi-bounce path trace from the current si
+        gt_light = path_trace_from_si(scene, si, sampler, mi.Spectrum(β),
+                                      max_depth=self.depth, rr_depth=2)
 
         # Compute VAPL prediction at the same si
         gaussians, vmfs = self.model(si)
@@ -467,153 +370,6 @@ class RHSIntegrator(ADIntegrator):
         vapl_l = mixture.illumination + Le_torch
 
         return vapl_l, gt_light, si
-
-    def sample_training_drjit(self, scene, sampler, ray, depth):
-        """DrJIT-native training path — no torch conversions."""
-        ray = mi.Ray3f(dr.detach(ray))
-        beta = mi.Spectrum(1)
-
-        si = scene.ray_intersect(
-            ray, ray_flags=mi.RayFlags.All, coherent=(depth == 0)
-        )
-
-        si, beta, _ = first_non_specular_or_null_si(scene, si, sampler, beta)
-        si.compute_uv_partials(ray)
-
-        # Compute ground truth at the same surface interaction
-        with dr.suspend_grad():
-            gt_light = mi.Spectrum(0)
-            beta_gt = mi.Spectrum(beta)
-            si_gt = si
-            for d in range(self.depth):
-                if d > 0:
-                    si_gt = scene.ray_intersect(
-                        ray_gt, ray_flags=mi.RayFlags.All, coherent=False
-                    )
-                    si_gt, beta_gt, _ = first_non_specular_or_null_si(scene, si_gt, sampler, beta_gt)
-                L, bs, beta_gt = render_rhs_original(scene, si_gt, sampler, beta_gt)
-                ray_gt = si_gt.spawn_ray(si_gt.to_world(bs.wo))
-                gt_light += L
-
-        gaussians_list, vmfs_list = self.model(si)
-
-        # Evaluate grid outputs to free intermediate JIT memory
-        # before the mixture convolution builds more AD nodes
-        for mean, var in gaussians_list:
-            dr.eval(mean, var)
-        for sh, ax, amp in vmfs_list:
-            dr.eval(sh, ax, amp)
-
-        mixture = vapl_mixture_drjit(gaussians_list, vmfs_list, self.sweep_encoding)
-        mixture.convolve(si, ray.d)
-
-        # Add direct emission so emitter surfaces aren't forced to zero.
-        # Le is constant w.r.t. grid params — no effect on backward pass,
-        # but removes impossible gradients at emitter surfaces.
-        Le = si.emitter(scene).eval(si)
-
-        return mixture.illumination + Le, gt_light, si
-
-    def sample_training_ref(self, scene: mi.Scene, sampler: mi.Sampler, ray: mi.Ray3f, depth: mi.UInt32):
-        w, h = list(scene.sensors()[0].film().size())
-        L = mi.Spectrum(0)
-        β = mi.Spectrum(1)
-        bsdf_ctx = mi.BSDFContext()
-
-        ray = mi.Ray3f(dr.detach(ray))
-        vapl_l = torch.zeros((w*h, 3), device="cuda")
-        res_l = mi.Spectrum(0)
-
-        si = scene.ray_intersect(
-            ray, ray_flags=mi.RayFlags.All, coherent=(depth==0)
-        )
-        si.compute_uv_partials(ray)
-
-        # update si and bsdf with the first non-specular ones
-        si, β, _ = first_non_specular_or_null_si(scene, si, sampler, β)
-
-        for depth in range(self.depth):
-            if (depth > 0):
-                si = scene.ray_intersect(
-                    ray, ray_flags=mi.RayFlags.All, coherent=(depth==0)
-                )
-
-                # update si and bsdf with the first non-specular ones
-                si, β, _ = first_non_specular_or_null_si(scene, si, sampler, β)
-
-
-            L, bs, β = render_rhs_original(scene, si, sampler, β)
-            ray = si.spawn_ray(si.to_world(bs.wo))
-
-            res_l = res_l + (L)
-
-        self.gt_light = res_l
-        return res_l, si
-
-    def sample_hybrid(self, scene: mi.Scene, sampler: mi.Sampler, ray: mi.Ray3f, depth: mi.UInt32):
-        """Hybrid inference: blend VAPL cache with path tracing.
-
-        Per-ray random split: vapl_ratio fraction of rays use VAPLs,
-        the rest use standard path tracing. Each path is weighted by
-        1/probability to keep the estimator consistent.
-        """
-        with dr.suspend_grad():
-            ray = mi.Ray3f(dr.detach(ray))
-            β = mi.Spectrum(1)
-
-            si = scene.ray_intersect(
-                ray, ray_flags=mi.RayFlags.All, coherent=(depth == 0)
-            )
-            si, β, _ = first_non_specular_or_null_si(scene, si, sampler, β)
-            si.compute_uv_partials(ray)
-
-            # Per-ray decision
-            use_vapl = sampler.next_1d() < self.vapl_ratio
-
-            # --- Path trace path ---
-            res = mi.Spectrum(0)
-            β_pt = mi.Spectrum(β)
-            si_pt = si
-            for d in range(2):
-                if d > 0:
-                    si_pt = scene.ray_intersect(
-                        ray_pt, ray_flags=mi.RayFlags.All, coherent=False
-                    )
-                    si_pt, β_pt, _ = first_non_specular_or_null_si(scene, si_pt, sampler, β_pt)
-
-                if d >= 1:
-                    # --- VAPL cache path ---
-                    active_cache = si_pt.is_valid()
-                    gaussians_list, vmfs_list = self.model(si_pt)
-
-                    for mean, var in gaussians_list:
-                        dr.eval(mean, var)
-                    for sh, ax, amp in vmfs_list:
-                        dr.eval(sh, ax, amp)
-
-                    mixture = vapl_mixture_drjit(gaussians_list, vmfs_list, self.sweep_encoding)
-                    mixture.convolve(si_pt, ray_pt.d)
-                    Le_cache = si.emitter(scene).eval(si)
-                    illum = mixture.illumination# + Le_cache
-                    # Only add VAPL contribution where the ray actually hit geometry
-                    res += dr.select(active_cache, β_pt * illum, mi.Spectrum(0))
-                    break
-                else:
-                    # render_rhs_original bakes β_pt into L, so accumulate directly
-                    L, bs, β_pt = render_rhs_original(scene, si_pt, sampler, β_pt)
-                    res += L
-
-                ray_pt = si_pt.spawn_ray(si_pt.to_world(bs.wo))
-                
-
-            # # Blend with inverse-probability weighting
-            # L = dr.select(
-            #     use_vapl,
-            #     L_vapl / self.vapl_ratio,
-            #     L_pt / (1.0 - self.vapl_ratio),
-            # )
-
-        return res, si
 
     def sample(self,
                mode: dr.ADMode,
@@ -630,11 +386,34 @@ class RHSIntegrator(ADIntegrator):
             self.model.set_current_epoch(self.epoch)
 
             if getattr(self.model, '_is_drjit', False):
-                # DrJIT-native training path
+                # DrJIT-native training path.
                 # ADIntegrator.render() wraps sample() in dr.suspend_grad(),
                 # which suppresses DrJIT AD. We must resume it explicitly.
                 with dr.resume_grad():
-                    vapl_light, gt_light, si = self.sample_training_drjit(scene, sampler, ray, depth)
+                    # Shared: find first non-specular hit (already suspends grad internally)
+                    ray_d  = mi.Ray3f(dr.detach(ray))
+                    beta   = mi.Spectrum(1)
+                    si_raw = scene.ray_intersect(ray_d, ray_flags=mi.RayFlags.All, coherent=(depth == 0))
+                    si, beta, _ = first_non_specular_or_null_si(scene, si_raw, sampler, beta)
+                    si.compute_uv_partials(ray_d)
+
+                    # GT: path trace from the first diffuse hit (no gradients)
+                    with dr.suspend_grad():
+                        gt_light = path_trace_from_si(scene, si, sampler, beta,
+                                                      max_depth=self.depth, rr_depth=2,
+                                                      indirect_only=self.indirect_only)
+
+                    # VAPL prediction at the same si (gradients flow through model)
+                    gaussians_list, vmfs_list = self.model(si)
+                    for mean, var in gaussians_list:
+                        dr.eval(mean, var)
+                    for sh, ax, amp in vmfs_list:
+                        dr.eval(sh, ax, amp)
+                    mixture = vapl_mixture_drjit(gaussians_list, vmfs_list, self.sweep_encoding)
+                    mixture.convolve(si, ray_d.d)
+                    # indirect_only: exclude Le so prediction matches GT (no direct emission)
+                    Le         = mi.Spectrum(0) if self.indirect_only else si.emitter(scene).eval(si)
+                    vapl_light = beta * (mixture.illumination + Le)
 
                     loss = self.drjit_loss_function(vapl_light, gt_light)
 
@@ -659,9 +438,13 @@ class RHSIntegrator(ADIntegrator):
                 torch.cuda.empty_cache()
                 return vapl_light.permute(1, 0), si.is_valid(), [], mi.Spectrum(0)
         else:
-            if self.vapl_ratio > 0:
-                L, si = self.sample_hybrid(scene, sampler, ray, depth)
-            else:
-                L, si = self.sample_training_ref(scene, sampler, ray, depth)
+            # Inference: same path as training GT for consistency
+            ray_d  = mi.Ray3f(dr.detach(ray))
+            beta   = mi.Spectrum(1)
+            si_raw = scene.ray_intersect(ray_d, ray_flags=mi.RayFlags.All, coherent=(depth == 0))
+            si, beta, _ = first_non_specular_or_null_si(scene, si_raw, sampler, beta)
+            L = path_trace_from_si(scene, si, sampler, beta,
+                                   max_depth=self.depth, rr_depth=2,
+                                   indirect_only=self.indirect_only)
             return L, si.is_valid(), [], mi.Spectrum(0)
 
