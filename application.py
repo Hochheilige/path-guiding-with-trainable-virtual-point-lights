@@ -242,18 +242,18 @@ class Application:
         p = pos.cpu().detach().numpy()
         amplitude = amplitude.cpu().detach().numpy()
         variance = variance.cpu().detach().numpy().flatten()
+        axis = axis.cpu().detach().numpy()
 
         # Filter by amplitude — keep only VPLs with non-negligible contribution
-        luminance = 0.2126 * amplitude[:, 0] + 0.7152 * amplitude[:, 1] + 0.0722 * amplitude[:, 2]
-        if luminance.size == 0 or luminance.max() == 0:
-            return
-        threshold = luminance.max() * 0.01
-        mask = luminance > threshold
-
-        p = p[mask]
-        amplitude = amplitude[mask]
-        variance = variance[mask]
-        axis = axis.cpu().detach().numpy()[mask]
+        # luminance = 0.2126 * amplitude[:, 0] + 0.7152 * amplitude[:, 1] + 0.0722 * amplitude[:, 2]
+        # if luminance.size == 0 or luminance.max() == 0:
+        #     return
+        # threshold = luminance.max() * 0.01
+        # mask = luminance > threshold
+        # p = p[mask]
+        # amplitude = amplitude[mask]
+        # variance = variance[mask]
+        # axis = axis[mask]
 
         if p.shape[0] == 0:
             return
