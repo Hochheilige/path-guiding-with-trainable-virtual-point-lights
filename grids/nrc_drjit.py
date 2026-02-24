@@ -117,6 +117,8 @@ class nrc_model_drjit:
 
     def __call__(self, si: mi.SurfaceInteraction3f, ray: mi.Ray3f, active=True):
         """Evaluate NRC: returns mi.Color3f indirect radiance."""
+        active = mi.Bool(active) & si.is_valid()
+
         self.mlp_coeffs.array[:] = Float16(self.opt['nrc'])
 
         features, diffuse, specular = self._build_features(si, ray)
