@@ -44,8 +44,8 @@ class SweepApp:
         self._app = WandbApp(self.config)
 
         self._app.integrator = RHSIntegrator(
-            self._app.grid, self._app.loss_function, True,
-            drjit_loss_name=self.config.loss, indirect_only=self.config.indirect_only
+            self._app.grid, True,
+            loss_name=self.config.loss, indirect_only=self.config.indirect_only
         )
         self._app.integrator.set_depth(self.config.depth)
 

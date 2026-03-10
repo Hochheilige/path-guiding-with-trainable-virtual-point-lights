@@ -5,7 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 
-from integrator import RHSIntegrator, Loss, relativeL2_luminance_tiny_cuda_nn
+from integrator import RHSIntegrator
 from grids import vapl_grid_base
 from utils.scene import world_to_ndc, ndc_to_pixel
 
@@ -42,10 +42,9 @@ class BaseApp:
         )
 
     def _create_integrator(self):
-        self.loss_function = Loss(relativeL2_luminance_tiny_cuda_nn)
         self.integrator = RHSIntegrator(
-            self.grid, self.loss_function, True,
-            drjit_loss_name=self.config.loss, indirect_only=self.config.indirect_only
+            self.grid, True,
+            loss_name=self.config.loss, indirect_only=self.config.indirect_only
         )
         self.integrator.set_depth(self.config.depth)
 

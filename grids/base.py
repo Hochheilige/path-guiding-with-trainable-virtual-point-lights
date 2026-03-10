@@ -88,7 +88,7 @@ class vapl_grid_base(torch.nn.Module):
             return vapl_grid_mlp_drjit(config, bb_min, bb_max)
         elif config.grid.layout == "nrc-drjit":
             from .nrc_drjit import nrc_model_drjit
-            return nrc_model_drjit(config)
+            return nrc_model_drjit(config, bb_min=bb_min, bb_max=bb_max)
         elif config.grid.layout == "mlp":
             from .torch_grid import vapl_grid_mlp
             return vapl_grid_mlp(config, bb_min, bb_max).cuda()

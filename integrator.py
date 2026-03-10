@@ -3,7 +3,6 @@ import mitsuba as mi
 mi.set_variant("cuda_ad_rgb")
 from mitsuba.python.ad.integrators.common import ADIntegrator, mis_weight
 
-import inspect
 import torch
 torch.autograd.set_detect_anomaly(True)
 
@@ -127,209 +126,202 @@ def path_trace_from_si(scene, si, sampler, beta, max_depth=4, rr_depth=2, indire
 
         return L
 
-# =============================================================================
-# Loss functions — Torch
-# =============================================================================
 
-class Loss():
-    def __init__(self, loss_fn):
-        self.loss_fn = loss_fn
-        self.num_params = len(inspect.signature(loss_fn).parameters)
+def compute_direct_at_si(scene, si, sampler, beta):
+    """Direct illumination at si: emitter emission + one NEE shadow ray (MIS).
 
-    def __call__(self, pred, target, weight = None):
-        if self.num_params == 2:
-            result = self.loss_fn(pred, target)
-        elif self.num_params == 3:
-            result = self.loss_fn(pred, target, weight)
-        return result
-
-def weighted_loss(predicted, real, weight):
-    eps = 0.01
-    mse = (real - predicted) ** 2
-    norm_factor = (weight * (predicted ** 2).detach() + eps)
-    return (mse / norm_factor).mean()
-
-def relativeL2(prediction, ref, pdf):
-    eps = 1e-2
-    div = prediction.detach()
-    denominator = torch.mean(div, dim=1).view(-1,1)**2 +eps
-
-    rL2 = (pdf*((prediction - ref))**2) / denominator
-    rL2 = rL2[~(torch.isinf(rL2) | torch.isnan(rL2))]
-    rL2 = rL2.mean()
-    return rL2
-
-def relativeL2_luminance(prediction, reference):
-    eps=1e-2
-    # luminance: 0.2126 R + 0.7152 G + 0.0722 B
-    luminance = (prediction.detach() * torch.tensor([0.2126, 0.7152, 0.0722], device=prediction.device)).sum(dim=1, keepdim=True)
-    denom = luminance ** 2 + eps
-
-    loss = ((prediction - reference) ** 2) / denom
-    loss = loss[~torch.isnan(loss) & ~torch.isinf(loss)]
-    return loss.mean()
-
-def relativeL2_luminance_tiny_cuda_nn(pred, target, pdf=None):
-    loss_scale=1.0
-    eps=1e-2
-
-    assert pred.shape == target.shape, "Prediction and target must have the same shape"
-    N, C = pred.shape
-    device = pred.device
-
-    rgb = pred[:, 0:3]
-    luminance = (0.299 * rgb[:, 0] + 0.587 * rgb[:, 1] + 0.114 * rgb[:, 2]).detach()
-    denom = luminance ** 2 + eps
-
-    if pdf is None:
-        pdf = torch.ones(N, device=device)
-    else:
-        pdf = pdf.detach().clamp(min=1e-6)
-
-    diff = pred - target
-    sq_error = diff ** 2
-
-    denom = denom.view(-1, 1)
-    pdf = pdf.view(-1, 1)
-    loss = sq_error / denom / pdf
-
-    valid = torch.isfinite(loss)
-    if not torch.all(valid):
-        loss = loss[valid]
-
-    if loss.numel() == 0:
-        return torch.tensor(0.0, device=device, requires_grad=True)
-
-    return loss_scale * loss.mean()
-
-def torch_mse(pred, target):
-    diff = pred - target
-    loss = (diff ** 2)
-    valid = torch.isfinite(loss)
-    if not torch.all(valid):
-        loss = loss[valid]
-    if loss.numel() == 0:
-        return torch.tensor(0.0, device=pred.device, requires_grad=True)
-    return loss.mean()
-
-def torch_log_relative(pred, target):
-    """Log-space loss — compresses dynamic range so dim indirect light
-    contributes as much as bright direct light."""
-    eps = 1e-4
-    log_pred = torch.log1p(pred.clamp(min=0) / eps)
-    log_target = torch.log1p(target.clamp(min=0) / eps)
-    loss = (log_pred - log_target) ** 2
-    valid = torch.isfinite(loss)
-    if not torch.all(valid):
-        loss = loss[valid]
-    if loss.numel() == 0:
-        return torch.tensor(0.0, device=pred.device, requires_grad=True)
-    return loss.mean()
-
-def torch_smape(pred, target):
-    """Symmetric Mean Absolute Percentage Error — balanced for both
-    bright and dim regions, no luminance denominator bias."""
-    eps = 1e-2
-    diff = torch.abs(pred - target)
-    denom = torch.abs(pred.detach()) + torch.abs(target) + eps
-    loss = diff / denom
-    valid = torch.isfinite(loss)
-    if not torch.all(valid):
-        loss = loss[valid]
-    if loss.numel() == 0:
-        return torch.tensor(0.0, device=pred.device, requires_grad=True)
-    return loss.mean()
-
-
-# =============================================================================
-# Loss functions — DrJIT
-# =============================================================================
-
-class DrJITLoss():
-    """Unified loss class for the DrJIT training path.
-
-    Usage:
-        loss_fn = DrJITLoss("relative_l2")   # or "mse", "log_relative", "smape"
-        loss = loss_fn(pred, target)
+    Always computed without gradients — safe to call inside dr.resume_grad().
+    Used by the NRC training path so the network only learns indirect light,
+    while direct is handled explicitly here and added to the rendered output.
     """
-    LOSSES = {
-        "relative_l2": "_relative_l2",
-        "mse": "_mse",
-        "log_relative": "_log_relative",
-        "smape": "_smape",
-    }
+    with dr.suspend_grad():
+        bsdf_ctx  = mi.BSDFContext()
+        bsdf      = si.bsdf()
+        active    = si.is_valid()
+        L         = mi.Spectrum(0)
 
-    def __init__(self, name="relative_l2"):
-        if name not in self.LOSSES:
-            raise ValueError(f"Unknown loss '{name}'. Choose from: {list(self.LOSSES.keys())}")
+        # Le: emission at si (non-zero when si is on an area light)
+        L += dr.select(active, beta * si.emitter(scene).eval(si), mi.Spectrum(0))
+
+        # NEE: one shadow ray to an emitter, MIS-weighted against BSDF PDF
+        active_em            = active & mi.has_flag(bsdf.flags(), mi.BSDFFlags.Smooth)
+        ds_em, em_weight     = scene.sample_emitter_direction(
+                                   si, sampler.next_2d(), True, active_em)
+        active_em           &= ds_em.pdf != 0.0
+        wo_em                = si.to_local(ds_em.d)
+        bsdf_val, bsdf_pdf_em = bsdf.eval_pdf(bsdf_ctx, si, wo_em, active_em)
+        mis_em               = dr.select(ds_em.delta, mi.Float(1.0),
+                                         mis_weight(ds_em.pdf, bsdf_pdf_em))
+        L += dr.select(active_em, beta * mis_em * bsdf_val * em_weight, mi.Spectrum(0))
+
+    return L
+
+
+# =============================================================================
+# Loss functions — unified (PyTorch + DrJIT)
+# =============================================================================
+
+class LossFn:
+    """Unified loss for both PyTorch and DrJIT backends.
+
+    Initialise once with a name from config.loss, then call:
+      loss_fn.torch(pred, target)   — PyTorch tensors  (regular / mlp grids)
+      loss_fn.drjit(pred, target)   — DrJIT Color3f    (drjit / nrc-drjit grids)
+
+    Available names: "relative_l2", "relative_l2_luminance",
+                     "mse", "log_relative", "smape"
+    """
+
+    NAMES = {"relative_l2", "relative_l2_luminance", "mse", "log_relative", "smape"}
+
+    def __init__(self, name: str = "relative_l2"):
+        if name not in self.NAMES:
+            raise ValueError(f"Unknown loss '{name}'. Choose from: {sorted(self.NAMES)}")
         self.name = name
-        self._fn = getattr(self, self.LOSSES[name])
 
-    def __call__(self, pred, target):
-        return self._fn(pred, target)
+    # ------------------------------------------------------------------
+    # Public dispatch
+    # ------------------------------------------------------------------
+
+    def torch(self, pred, target):
+        return self._TORCH[self.name](pred, target)
+
+    def drjit(self, pred, target):
+        return self._DRJIT[self.name](pred, target)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
-    def _filter(loss_per_ray):
+    def _torch_filter(loss):
+        valid = torch.isfinite(loss)
+        if not torch.all(valid):
+            loss = loss[valid]
+        if loss.numel() == 0:
+            return torch.tensor(0.0, device=loss.device, requires_grad=True)
+        return loss.mean()
+
+    @staticmethod
+    def _drjit_filter(loss_per_ray):
         valid = dr.isfinite(loss_per_ray)
         loss_per_ray = dr.select(valid, loss_per_ray, mi.Float(0.0))
         n = mi.Float(dr.width(loss_per_ray))
         return dr.sum(loss_per_ray) / dr.maximum(n, mi.Float(1.0))
 
+    # ------------------------------------------------------------------
+    # PyTorch implementations
+    # ------------------------------------------------------------------
+
     @staticmethod
-    def _relative_l2(pred, target):
-        """Relative L2 luminance loss (original)."""
+    def _torch_relative_l2(pred, target):
+        """Relative L2 matching tiny-cuda-nn (NRC paper authors):
+        each channel divided by its own squared prediction value.
+        loss = Σ_c (pred_c - target_c)² / (pred_c² + ε)
+        Source: tiny-cuda-nn/include/tiny-cuda-nn/losses/relative_l2.h"""
         eps = 1e-2
-        pred_d = dr.detach(pred)
-        luminance = 0.2126 * pred_d.x + 0.7152 * pred_d.y + 0.0722 * pred_d.z
-        denom = luminance * luminance + eps
-        sq_error = dr.squared_norm(pred - target)
-        return DrJITLoss._filter(sq_error / denom)
+        denom = pred.detach() ** 2 + eps   # per-channel, shape (N, C)
+        return LossFn._torch_filter((pred - target) ** 2 / denom)
 
     @staticmethod
-    def _mse(pred, target):
-        """Plain mean squared error."""
-        sq_error = dr.squared_norm(pred - target)
-        return DrJITLoss._filter(sq_error)
+    def _torch_relative_l2_luminance(pred, target):
+        """Relative L2 with luminance denominator: denom = lum(pred_stop)² + ε."""
+        eps = 1e-2
+        lum = (pred.detach() * torch.tensor([0.2126, 0.7152, 0.0722], device=pred.device)).sum(dim=1, keepdim=True)
+        denom = lum ** 2 + eps
+        return LossFn._torch_filter((pred - target) ** 2 / denom)
 
     @staticmethod
-    def _log_relative(pred, target):
-        """Log-space loss — compresses dynamic range so dim indirect light
-        contributes as much as bright direct light."""
+    def _torch_mse(pred, target):
+        return LossFn._torch_filter((pred - target) ** 2)
+
+    @staticmethod
+    def _torch_log_relative(pred, target):
         eps = 1e-4
-        log_pred = dr.log(1.0 + dr.maximum(pred, mi.Spectrum(0)) / eps)
-        log_target = dr.log(1.0 + dr.maximum(target, mi.Spectrum(0)) / eps)
-        diff = log_pred - log_target
-        sq_error = dr.squared_norm(diff)
-        return DrJITLoss._filter(sq_error)
+        log_pred   = torch.log1p(pred.clamp(min=0) / eps)
+        log_target = torch.log1p(target.clamp(min=0) / eps)
+        return LossFn._torch_filter((log_pred - log_target) ** 2)
 
     @staticmethod
-    def _smape(pred, target):
-        """Symmetric Mean Absolute Percentage Error — balanced for both
-        bright and dim regions."""
+    def _torch_smape(pred, target):
+        eps = 1e-2
+        diff  = torch.abs(pred - target)
+        denom = torch.abs(pred.detach()) + torch.abs(target) + eps
+        return LossFn._torch_filter(diff / denom)
+
+    # ------------------------------------------------------------------
+    # DrJIT implementations
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _drjit_relative_l2(pred, target):
+        """Relative L2 matching tiny-cuda-nn (NRC paper authors):
+        each channel divided by its own squared prediction value.
+        loss = Σ_c (pred_c - target_c)² / (pred_c² + ε)
+        Source: tiny-cuda-nn/include/tiny-cuda-nn/losses/relative_l2.h"""
         eps = 1e-2
         pred_d = dr.detach(pred)
-        diff = dr.abs(pred - target)
-        denom_r = dr.abs(pred_d.x) + dr.abs(target.x) + eps
-        denom_g = dr.abs(pred_d.y) + dr.abs(target.y) + eps
-        denom_b = dr.abs(pred_d.z) + dr.abs(target.z) + eps
-        loss_per_ray = diff.x / denom_r + diff.y / denom_g + diff.z / denom_b
-        return DrJITLoss._filter(loss_per_ray)
+        diff   = pred - target
+        loss   = (diff.x * diff.x / (pred_d.x * pred_d.x + eps)
+                + diff.y * diff.y / (pred_d.y * pred_d.y + eps)
+                + diff.z * diff.z / (pred_d.z * pred_d.z + eps))
+        return LossFn._drjit_filter(loss)
+
+    @staticmethod
+    def _drjit_relative_l2_luminance(pred, target):
+        """Relative L2 with luminance denominator: denom = lum(pred_stop)² + ε."""
+        eps = 1e-2
+        pred_d = dr.detach(pred)
+        lum    = 0.2126 * pred_d.x + 0.7152 * pred_d.y + 0.0722 * pred_d.z
+        denom  = lum * lum + eps
+        return LossFn._drjit_filter(dr.squared_norm(pred - target) / denom)
+
+    @staticmethod
+    def _drjit_mse(pred, target):
+        return LossFn._drjit_filter(dr.squared_norm(pred - target))
+
+    @staticmethod
+    def _drjit_log_relative(pred, target):
+        eps        = 1e-4
+        log_pred   = dr.log(1.0 + dr.maximum(pred,   mi.Spectrum(0)) / eps)
+        log_target = dr.log(1.0 + dr.maximum(target, mi.Spectrum(0)) / eps)
+        return LossFn._drjit_filter(dr.squared_norm(log_pred - log_target))
+
+    @staticmethod
+    def _drjit_smape(pred, target):
+        eps    = 1e-2
+        pred_d = dr.detach(pred)
+        diff   = dr.abs(pred - target)
+        loss   = (diff.x / (dr.abs(pred_d.x) + dr.abs(target.x) + eps)
+                + diff.y / (dr.abs(pred_d.y) + dr.abs(target.y) + eps)
+                + diff.z / (dr.abs(pred_d.z) + dr.abs(target.z) + eps))
+        return LossFn._drjit_filter(loss)
 
 
-# Legacy alias so existing code keeps working
-def compute_drjit_loss(pred, target):
-    return DrJITLoss._relative_l2(pred, target)
+LossFn._TORCH = {
+    "relative_l2":           LossFn._torch_relative_l2,
+    "relative_l2_luminance": LossFn._torch_relative_l2_luminance,
+    "mse":                   LossFn._torch_mse,
+    "log_relative":          LossFn._torch_log_relative,
+    "smape":                 LossFn._torch_smape,
+}
+LossFn._DRJIT = {
+    "relative_l2":           LossFn._drjit_relative_l2,
+    "relative_l2_luminance": LossFn._drjit_relative_l2_luminance,
+    "mse":                   LossFn._drjit_mse,
+    "log_relative":          LossFn._drjit_log_relative,
+    "smape":                 LossFn._drjit_smape,
+}
 
 
 class RHSIntegrator(ADIntegrator):
-    def __init__(self, model, loss_function : Loss, train, sweep_encoding = None,
-                 drjit_loss_name="relative_l2", indirect_only=False, props=mi.Properties()):
+    def __init__(self, model, train, loss_name: str = "relative_l2",
+                 sweep_encoding=None, indirect_only=False, props=mi.Properties()):
         super().__init__(props)
         self.train = train
         self.model = model
         self.losses = []
-        self.loss_function = loss_function              # torch path
-        self.drjit_loss_function = DrJITLoss(drjit_loss_name)  # drjit path
+        self.loss_fn = LossFn(loss_name)
         self.sweep_encoding = sweep_encoding
         self.indirect_only = indirect_only
         self.depth = 1
@@ -397,17 +389,28 @@ class RHSIntegrator(ADIntegrator):
                     si, beta, _ = first_non_specular_or_null_si(scene, si_raw, sampler, beta)
                     si.compute_uv_partials(ray_d)
 
-                    # GT: path trace from the first diffuse hit (no gradients)
-                    with dr.suspend_grad():
-                        gt_light = path_trace_from_si(scene, si, sampler, beta,
-                                                      max_depth=self.depth, rr_depth=2,
-                                                      indirect_only=self.indirect_only)
-
                     # Model prediction at the same si (gradients flow through model)
                     if getattr(self.model, '_is_nrc', False):
-                        # NRC: model(si, ray) → Color3f indirect radiance directly
-                        vapl_light = beta * self.model(si, ray_d)
+                        with dr.suspend_grad():
+                            gt_light = path_trace_from_si(scene, si, sampler, beta,
+                                                          max_depth=self.depth, rr_depth=2,
+                                                          indirect_only=self.indirect_only)
+                            if self.indirect_only:
+                                direct = compute_direct_at_si(scene, si, sampler, beta)
+                        nrc_light     = dr.maximum(beta * self.model(si, ray_d), mi.Color3f(0.0))
+                        vapl_light    = nrc_light + direct if self.indirect_only else nrc_light
+                        pred_for_loss = nrc_light
+                        loss = self.loss_fn.drjit(pred_for_loss, gt_light)
+                        dr.backward(self.model.scaler.scale(loss))
+                        self.model.optimizer.step()
+                        self.losses.append(float(loss[0]))
+                        return vapl_light, si.is_valid(), [], mi.Spectrum(0)
                     else:
+                        # GT: path trace from the first diffuse hit (no gradients)
+                        with dr.suspend_grad():
+                            gt_light = path_trace_from_si(scene, si, sampler, beta,
+                                                          max_depth=self.depth, rr_depth=2,
+                                                          indirect_only=self.indirect_only)
                         # VAPL prediction
                         gaussians_list, vmfs_list = self.model(si)
                         for mean, var in gaussians_list:
@@ -416,13 +419,11 @@ class RHSIntegrator(ADIntegrator):
                             dr.eval(sh, ax, amp)
                         mixture = vapl_mixture_drjit(gaussians_list, vmfs_list, self.sweep_encoding)
                         mixture.convolve(si, ray_d.d)
-                        # indirect_only: exclude Le so prediction matches GT (no direct emission)
-                        Le         = mi.Spectrum(0) if self.indirect_only else si.emitter(scene).eval(si)
-                        vapl_light = beta * (mixture.illumination + Le)
+                        Le            = mi.Spectrum(0) if self.indirect_only else si.emitter(scene).eval(si)
+                        vapl_light    = beta * (mixture.illumination + Le)
+                        pred_for_loss = vapl_light
 
-                    loss = self.drjit_loss_function(vapl_light, gt_light)
-
-                    # Mixed-precision: scale loss before backward, then scaled step
+                    loss = self.loss_fn.drjit(pred_for_loss, gt_light)
                     dr.backward(self.model.scaler.scale(loss))
                     self.model.optimizer.step()
 
@@ -434,7 +435,7 @@ class RHSIntegrator(ADIntegrator):
                 vapl_light, gt_light, si = self.sample_training(scene, sampler, ray, depth)
                 GT_Light = torch.from_numpy(gt_light.numpy()).to("cuda").T
 
-                loss : torch.Tensor = self.loss_function(vapl_light, GT_Light, None)
+                loss : torch.Tensor = self.loss_fn.torch(vapl_light, GT_Light)
                 self.losses.append(loss.detach().cpu())
                 self.model.optimizer.zero_grad()
                 loss.backward()
@@ -443,13 +444,11 @@ class RHSIntegrator(ADIntegrator):
                 torch.cuda.empty_cache()
                 return vapl_light.permute(1, 0), si.is_valid(), [], mi.Spectrum(0)
         else:
-            # Inference
-            ray_d  = mi.Ray3f(dr.detach(ray))
-            beta   = mi.Spectrum(1)
-            si_raw = scene.ray_intersect(ray_d, ray_flags=mi.RayFlags.All, coherent=(depth == 0))
-            si, beta, _ = first_non_specular_or_null_si(scene, si_raw, sampler, beta)
-            L = path_trace_from_si(scene, si, sampler, beta,
-                                   max_depth=self.depth, rr_depth=2,
-                                   indirect_only=self.indirect_only)
+            # Inference: plain path trace from the first ray intersection
+            ray_d = mi.Ray3f(dr.detach(ray))
+            si    = scene.ray_intersect(ray_d, ray_flags=mi.RayFlags.All, coherent=(depth == 0))
+            L     = path_trace_from_si(scene, si, sampler, mi.Spectrum(1),
+                                       max_depth=self.depth, rr_depth=2,
+                                       indirect_only=self.indirect_only)
             return L, si.is_valid(), [], mi.Spectrum(0)
 
