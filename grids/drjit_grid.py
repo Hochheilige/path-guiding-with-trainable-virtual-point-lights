@@ -241,6 +241,8 @@ class vapl_grid_drjit:
     def __call__(self, si_or_pos):
         if isinstance(si_or_pos, mi.SurfaceInteraction3f):
             pos = si_or_pos.p
+            # Guard: invalid si has p=inf, which causes CUDA illegal address in hash grid
+            pos = dr.select(si_or_pos.is_valid(), pos, mi.Point3f(0))
             if self.config.grid.stochastic_interpolation:
                 n = dr.width(pos)
                 offset_s = mi.Float(np.random.normal(size=n).astype(np.float32)) * self.config.grid.stochastic_std

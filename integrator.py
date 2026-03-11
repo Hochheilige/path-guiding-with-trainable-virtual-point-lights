@@ -325,9 +325,13 @@ class RHSIntegrator(ADIntegrator):
         self.sweep_encoding = sweep_encoding
         self.indirect_only = indirect_only
         self.depth = 1
+        self.path_trace = False
 
     def set_train(self, train):
         self.train = train
+
+    def set_path_trace(self, enabled):
+        self.path_trace = enabled
 
     def set_depth(self, depth):
         self.depth = depth
@@ -373,6 +377,16 @@ class RHSIntegrator(ADIntegrator):
                δaovs,
                state_in,
                active):
+
+        if self.path_trace:
+            ray_d  = mi.Ray3f(dr.detach(ray))
+            beta   = mi.Spectrum(1)
+            si_raw = scene.ray_intersect(ray_d, ray_flags=mi.RayFlags.All, coherent=(depth == 0))
+            si, beta, _ = first_non_specular_or_null_si(scene, si_raw, sampler, beta)
+            L = path_trace_from_si(scene, si, sampler, beta,
+                                   max_depth=self.depth, rr_depth=2,
+                                   indirect_only=self.indirect_only)
+            return L, si.is_valid(), [], mi.Spectrum(0)
 
         if self.train:
             self.model.set_current_epoch(self.epoch)
@@ -420,7 +434,7 @@ class RHSIntegrator(ADIntegrator):
                         mixture = vapl_mixture_drjit(gaussians_list, vmfs_list, self.sweep_encoding)
                         mixture.convolve(si, ray_d.d)
                         Le            = mi.Spectrum(0) if self.indirect_only else si.emitter(scene).eval(si)
-                        vapl_light    = beta * (mixture.illumination + Le)
+                        vapl_light    = dr.maximum(beta * (mixture.illumination + Le), mi.Color3f(0.0))
                         pred_for_loss = vapl_light
 
                     loss = self.loss_fn.drjit(pred_for_loss, gt_light)
@@ -442,13 +456,42 @@ class RHSIntegrator(ADIntegrator):
                 self.model.optimizer.step()
 
                 torch.cuda.empty_cache()
-                return vapl_light.permute(1, 0), si.is_valid(), [], mi.Spectrum(0)
+                return vapl_light.clamp(min=0).permute(1, 0), si.is_valid(), [], mi.Spectrum(0)
         else:
-            # Inference: plain path trace from the first ray intersection
-            ray_d = mi.Ray3f(dr.detach(ray))
-            si    = scene.ray_intersect(ray_d, ray_flags=mi.RayFlags.All, coherent=(depth == 0))
-            L     = path_trace_from_si(scene, si, sampler, mi.Spectrum(1),
-                                       max_depth=self.depth, rr_depth=2,
-                                       indirect_only=self.indirect_only)
+            # Inference: NRC paper Fig 2 — 1-bounce path with NEE at x1,
+            # then terminate into the cache at x2.
+            # L = Le(x1) + NEE(x1) + bsdf_weight(x1→x2) * cache(x2)
+            ray_d  = mi.Ray3f(dr.detach(ray))
+            beta   = mi.Spectrum(1)
+            si_raw = scene.ray_intersect(ray_d, ray_flags=mi.RayFlags.All, coherent=(depth == 0))
+            si, beta, _ = first_non_specular_or_null_si(scene, si_raw, sampler, beta)
+
+            # Direct illumination at x1: Le + one NEE shadow ray
+            L = compute_direct_at_si(scene, si, sampler, beta)
+            dr.eval(L)
+
+            # BSDF sample at x1 → trace to x2
+            bsdf_sample, bsdf_weight = si.bsdf().sample(
+                mi.BSDFContext(), si, sampler.next_1d(), sampler.next_2d(), si.is_valid()
+            )
+            beta2 = beta * bsdf_weight
+            ray2  = si.spawn_ray(si.to_world(bsdf_sample.wo))
+            si2   = scene.ray_intersect(ray2, ray_flags=mi.RayFlags.All, coherent=False)
+            # Force evaluation here: breaks the lazy graph so the model receives
+            # concrete si2 data rather than a fused bsdf_sample+intersect+model kernel
+            # that would take minutes to JIT-compile.
+            dr.eval(si2)
+
+            # Query cache at x2
+            if getattr(self.model, '_is_nrc', False):
+                cache2 = dr.maximum(beta2 * self.model(si2, ray2), mi.Color3f(0.0))
+            else:
+                gaussians_list, vmfs_list = self.model(si2)
+                mixture = vapl_mixture_drjit(gaussians_list, vmfs_list, self.sweep_encoding)
+                mixture.convolve(si2, ray2.d)
+                Le2    = mi.Spectrum(0) if self.indirect_only else si2.emitter(scene).eval(si2)
+                cache2 = dr.maximum(beta2 * (mixture.illumination + Le2), mi.Color3f(0.0))
+
+            L += dr.select(si2.is_valid(), cache2, mi.Spectrum(0))
             return L, si.is_valid(), [], mi.Spectrum(0)
 
