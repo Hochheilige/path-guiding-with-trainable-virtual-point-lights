@@ -1,6 +1,8 @@
 import mitsuba as mi
 mi.set_variant("cuda_ad_rgb")
 
+import os
+import glob
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
@@ -8,6 +10,36 @@ import torch
 from integrator import RHSIntegrator
 from grids import vapl_grid_base
 from utils.scene import world_to_ndc, ndc_to_pixel
+
+_SCENES_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "scenes")
+
+
+def _resolve_scene_path(name: str) -> str:
+    """Convert a scene name to an xml file path.
+
+    Resolution order (slug = name with spaces→underscores, lowercased):
+      1. scenes/<slug>.xml          — bare xml at top level
+      2. scenes/<slug>/scene.xml    — conventional subfolder layout
+      3. scenes/<slug>/**/*.xml     — first xml found anywhere inside folder
+      4. Fall back to treating `name` as a literal path (backward compat).
+    """
+    slug = name.strip().lower().replace(" ", "_")
+    candidates = [
+        os.path.join(_SCENES_DIR, f"{slug}.xml"),
+        os.path.join(_SCENES_DIR, slug, "scene.xml"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+
+    # Any xml inside a folder named after the slug
+    pattern = os.path.join(_SCENES_DIR, slug, "**", "*.xml")
+    matches = glob.glob(pattern, recursive=True)
+    if matches:
+        return matches[0]
+
+    # Literal path fallback for backward compatibility
+    return name
 
 
 class BaseApp:
@@ -34,7 +66,7 @@ class BaseApp:
             }
             self.scene : mi.Scene = mi.load_dict(scene_dict)
         else:
-            self.scene : mi.Scene = mi.load_file(config.scene)
+            self.scene : mi.Scene = mi.load_file(_resolve_scene_path(config.scene))
 
     def _create_grid(self):
         self.grid = vapl_grid_base.create_vapl_grid(
