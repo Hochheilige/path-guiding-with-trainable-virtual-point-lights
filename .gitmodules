@@ -1,0 +1,4 @@
+[submodule "falcor"]
+	path = falcor
+	url = https://github.com/Mishok43/NeuralFalcor
+	branch = Mike
