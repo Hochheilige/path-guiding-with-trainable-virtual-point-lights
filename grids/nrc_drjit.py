@@ -85,7 +85,7 @@ class nrc_model_drjit:
     #   ── total = 64
     INPUT_DIM  = 64
     N_NEURONS  = 64
-    N_HIDDEN   = 5
+    N_HIDDEN   = 3   # paper: 4 hidden layers = 1 (first) + 3 (N_HIDDEN) + 1 (output)
     OUTPUT_DIM = 3
 
     def __init__(self, config, bb_min=None, bb_max=None):
@@ -102,7 +102,7 @@ class nrc_model_drjit:
             self._bbox_min = mi.Point3f(-1.0)
             self._bbox_max = mi.Point3f( 1.0)
 
-        # Build MLP: 64 → [64×ReLU] × 5 → 3  (no bias, as per NRC paper)
+        # Build MLP: 64 → [64×ReLU] × 4 → 3  (no bias, as per NRC paper Table 1)
         mlp_alloc = dr.nn.Sequential(
             dr.nn.Linear(self.INPUT_DIM, self.N_NEURONS, bias=False), dr.nn.ReLU(),
             *(item for _ in range(self.N_HIDDEN)
@@ -110,10 +110,9 @@ class nrc_model_drjit:
             dr.nn.Linear(self.N_NEURONS, self.OUTPUT_DIM, bias=False)
         ).alloc(TensorXf16, self.INPUT_DIM)
 
-        # Scale down ONLY the output layer before packing (not all layers).
-        # Scaling all layers by 0.1 causes Float16 signal vanishing through
-        # 5 deep hidden layers (outputs collapse to exactly 0.0, blocking grads).
-        # Only the output layer needs small init so the MLP starts near zero.
+        # Scale down ONLY the output layer so the MLP starts near zero output.
+        # Scaling all layers causes Float16 signal vanishing through hidden layers
+        # (outputs collapse to 0.0, blocking grads); only the output layer needs it.
         # Must be done before pack() — post-pack scatter breaks mlp's internal
         # AD reference to mlp_coeffs, making weight gradients zero.
         for layer in mlp_alloc.layers:
@@ -125,8 +124,10 @@ class nrc_model_drjit:
         lr = config.optimizer.learning_rate
         self.opt = dr.opt.Adam(lr=lr)
         self.opt['nrc'] = mi.Float(self.mlp_coeffs.array)
-        # init_scale=1.0: skip loss scaling (avoids Float16 overflow in 5-layer backward)
-        self.scaler = dr.opt.GradScaler(init_scale=1.0)
+        # Moderate loss scaling to prevent Float16 gradient underflow in the backward pass.
+        # init_scale=1.0 was previously needed to avoid overflow with the too-deep 6-layer
+        # network; with the correct 4-layer depth, 128 is safe and prevents underflow.
+        self.scaler = dr.opt.GradScaler(init_scale=128.0)
 
     @property
     def optimizer(self):
