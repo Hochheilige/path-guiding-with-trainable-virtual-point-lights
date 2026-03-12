@@ -84,6 +84,7 @@ class CompareApp(BaseApp):
         self.nrc_integrator = RHSIntegrator(
             self.nrc_model, True,
             loss_name=self.config.loss, indirect_only=self.config.indirect_only,
+            nrc_depth=self.config.nrc_suffix_depth,
         )
         self.nrc_integrator.set_depth(self.config.depth)
 

@@ -47,6 +47,74 @@ def first_non_specular_or_null_si(scene, si, sampler, β):
 
 
 @dr.syntax
+def _nrc_suffix_target(scene, si2, sampler, beta2, model, ray2, n_suffix):
+    """NRC suffix-path training target with self-training (Mueller et al. 2021, Section 4).
+
+    Traces n_suffix bounces from x_2 with full MIS+NEE, then queries the cache at
+    the terminal vertex x_k with a stop-gradient.  This is the paper's core training
+    mechanism: the cache bootstraps itself by using its own current estimate at the
+    path's tail, letting short suffix paths (n_suffix=2) represent infinite-bounce
+    transport after enough training iterations.
+
+    Called inside dr.suspend_grad() → model(x_k) is automatically detached
+    (no AD edge through the terminal cache query).
+    """
+    with dr.suspend_grad():
+        bsdf_ctx = mi.BSDFContext()
+        L        = mi.Spectrum(0)
+        beta     = mi.Spectrum(beta2)
+        si       = si2
+        ray      = ray2
+        depth    = mi.UInt32(0)
+        active   = si.is_valid()
+
+        prev_si         = dr.zeros(mi.SurfaceInteraction3f)
+        prev_bsdf_pdf   = mi.Float(1.0)
+        prev_bsdf_delta = mi.Bool(True)
+
+        while active & (depth < mi.UInt32(n_suffix)):
+            bsdf = si.bsdf()
+
+            # MIS-weighted emission at current vertex
+            ds_prev = mi.DirectionSample3f(scene, si=si, ref=prev_si)
+            em_pdf  = scene.pdf_emitter_direction(prev_si, ds_prev, ~prev_bsdf_delta & active)
+            mis_b   = dr.select(prev_bsdf_delta, mi.Float(1.0), mis_weight(prev_bsdf_pdf, em_pdf))
+            L += beta * mis_b * si.emitter(scene).eval(si)
+
+            # NEE
+            active_em            = active & mi.has_flag(bsdf.flags(), mi.BSDFFlags.Smooth)
+            ds_em, em_weight     = scene.sample_emitter_direction(si, sampler.next_2d(), True, active_em)
+            active_em           &= ds_em.pdf != 0.0
+            bsdf_val, bsdf_pdf_e = bsdf.eval_pdf(bsdf_ctx, si, si.to_local(ds_em.d), active_em)
+            mis_em               = dr.select(ds_em.delta, mi.Float(1.0), mis_weight(ds_em.pdf, bsdf_pdf_e))
+            L += dr.select(active_em, beta * mis_em * bsdf_val * em_weight, mi.Spectrum(0))
+
+            # BSDF sample → next vertex
+            bsdf_sample, bsdf_w = bsdf.sample(bsdf_ctx, si, sampler.next_1d(), sampler.next_2d(), active)
+            beta *= bsdf_w
+
+            prev_si         = dr.detach(si, True)
+            prev_bsdf_pdf   = bsdf_sample.pdf
+            prev_bsdf_delta = mi.has_flag(bsdf_sample.sampled_type, mi.BSDFFlags.Delta)
+
+            ray    = si.spawn_ray(si.to_world(bsdf_sample.wo))
+            si     = scene.ray_intersect(ray, ray_flags=mi.RayFlags.All, coherent=False)
+            active &= si.is_valid()
+            depth  += 1
+
+        # Terminal self-training cache query — detached (no grad through here).
+        # model() is called inside suspend_grad so the scatter mlp_coeffs←opt['nrc']
+        # creates no AD edge; the MLP output has no gradient.  This is the
+        # "stop-gradient on the target" required to avoid gradient loops.
+        term = mi.Color3f(model(si, ray))
+        term = mi.Color3f(dr.maximum(term.x, mi.Float(0.0)),
+                          dr.maximum(term.y, mi.Float(0.0)),
+                          dr.maximum(term.z, mi.Float(0.0)))
+        L += dr.select(active, beta * term, mi.Spectrum(0))
+        return L
+
+
+@dr.syntax
 def path_trace_from_si(scene, si, sampler, beta, max_depth=4, rr_depth=2, indirect_only=False):
     """Multi-bounce path tracer starting from a given surface interaction.
 
@@ -316,7 +384,7 @@ LossFn._DRJIT = {
 
 class RHSIntegrator(ADIntegrator):
     def __init__(self, model, train, loss_name: str = "relative_l2",
-                 sweep_encoding=None, indirect_only=False, props=mi.Properties()):
+                 sweep_encoding=None, indirect_only=False, nrc_depth=2, props=mi.Properties()):
         super().__init__(props)
         self.train = train
         self.model = model
@@ -326,12 +394,19 @@ class RHSIntegrator(ADIntegrator):
         self.indirect_only = indirect_only
         self.depth = 1
         self.path_trace = False
+        self.cache_only = False
+        self.nrc_depth = nrc_depth
 
     def set_train(self, train):
         self.train = train
 
     def set_path_trace(self, enabled):
         self.path_trace = enabled
+
+    def set_cache_only(self, enabled):
+        """Inference mode that returns only bsdf_w * cache(x2), no direct(x1).
+        Useful for visualising what the grid has learned at x2 in isolation."""
+        self.cache_only = enabled
 
     def set_depth(self, depth):
         self.depth = depth
@@ -405,19 +480,51 @@ class RHSIntegrator(ADIntegrator):
 
                     # Model prediction at the same si (gradients flow through model)
                     if getattr(self.model, '_is_nrc', False):
+                        # NRC paper (Section 4): train the cache at x_2 (the BSDF-sampled
+                        # vertex from x_1), NOT at x_1 (the camera-visible vertex).
+                        # Inference queries the cache at x_2, so training must do the same
+                        # to avoid a surface-distribution mismatch that causes color artifacts
+                        # in complex scenes (country kitchen, veach mis).
                         with dr.suspend_grad():
-                            gt_light = path_trace_from_si(scene, si, sampler, beta,
-                                                          max_depth=self.depth, rr_depth=2,
-                                                          indirect_only=self.indirect_only)
-                            if self.indirect_only:
-                                direct = compute_direct_at_si(scene, si, sampler, beta)
-                        nrc_light     = dr.maximum(beta * self.model(si, ray_d), mi.Color3f(0.0))
-                        vapl_light    = nrc_light + direct if self.indirect_only else nrc_light
-                        pred_for_loss = nrc_light
-                        loss = self.loss_fn.drjit(pred_for_loss, gt_light)
+                            direct_x1 = compute_direct_at_si(scene, si, sampler, beta)
+
+                            # BSDF sample: x_1 → x_2
+                            bsdf_sample_tr, bsdf_w_tr = si.bsdf().sample(
+                                mi.BSDFContext(), si,
+                                sampler.next_1d(), sampler.next_2d(), si.is_valid()
+                            )
+                            beta2_tr = beta * bsdf_w_tr
+                            ray2_tr  = si.spawn_ray(si.to_world(bsdf_sample_tr.wo))
+                            si2_tr   = scene.ray_intersect(ray2_tr, ray_flags=mi.RayFlags.All, coherent=False)
+                            dr.eval(si2_tr)
+
+                            # Training target at x_2: short suffix path terminating into
+                            # a detached cache query (self-training bootstrap).
+                            # With n_suffix=0 this falls back to a plain path trace from x_2.
+                            n_suffix = self.nrc_depth
+                            if n_suffix > 0:
+                                gt_light = _nrc_suffix_target(
+                                    scene, si2_tr, sampler, beta2_tr,
+                                    self.model, ray2_tr, n_suffix
+                                )
+                            else:
+                                gt_light = path_trace_from_si(
+                                    scene, si2_tr, sampler, beta2_tr,
+                                    max_depth=self.depth, rr_depth=2,
+                                    indirect_only=False
+                                )
+
+                        # Primary cache prediction at x_2 — gradients flow here.
+                        # The weight scatter mlp_coeffs←opt['nrc'] happens again here
+                        # (inside resume_grad) creating the correct AD edge.
+                        nrc_pred = dr.maximum(beta2_tr * self.model(si2_tr, ray2_tr), mi.Color3f(0.0))
+                        loss = self.loss_fn.drjit(nrc_pred, gt_light)
                         dr.backward(self.model.scaler.scale(loss))
                         self.model.optimizer.step()
                         self.losses.append(float(loss[0]))
+
+                        # Output: direct at x_1 + cache contribution from x_2
+                        vapl_light = direct_x1 + dr.select(si2_tr.is_valid(), nrc_pred, mi.Spectrum(0))
                         return vapl_light, si.is_valid(), [], mi.Spectrum(0)
                     else:
                         # GT: path trace from the first diffuse hit (no gradients)
@@ -467,7 +574,7 @@ class RHSIntegrator(ADIntegrator):
             si, beta, _ = first_non_specular_or_null_si(scene, si_raw, sampler, beta)
 
             # Direct illumination at x1: Le + one NEE shadow ray
-            L = compute_direct_at_si(scene, si, sampler, beta)
+            L = mi.Spectrum(0) if self.cache_only else compute_direct_at_si(scene, si, sampler, beta)
             dr.eval(L)
 
             # BSDF sample at x1 → trace to x2
