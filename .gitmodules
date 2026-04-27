@@ -1,4 +1,4 @@
 [submodule "falcor"]
 	path = falcor
-	url = https://github.com/Mishok43/NeuralFalcor
-	branch = Mike
+	url = https://github.com/NVIDIAGameWorks/Falcor
+	shallow = true
