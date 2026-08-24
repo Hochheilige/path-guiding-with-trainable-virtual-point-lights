@@ -7,6 +7,7 @@ from .sg_vmf_drjit import (
     vmf_hemispherical_integral, sg_integral,
     compute_jacobian, isotropic_ndf_filtering,
     sggx, sgg_reflection_pdf,
+    sample_vmf_with_samples, vmf_pdf,
 )
 
 
@@ -29,6 +30,128 @@ class vapl_mixture_drjit:
         self.illumination = mi.Color3f(0.0)
         self.diffuse_illumination = mi.Color3f(0.0)
         self.specular_illumination = mi.Color3f(0.0)
+
+        self.light_lobe_axes = []
+        self.light_lobe_sharpnesses = []
+        self.vapl_weights = []
+
+    def compute_vapl_weights(self, si, view_dir):
+        """Compute normalized per-level weights using the full BSDF convolution.
+
+        Mirrors calculate_normalized_vapl_weights() from the PyTorch class:
+        run the full illumination convolution for each level independently,
+        use the luminance of each level's contribution as its sampling weight.
+        Stores result in self.vapl_weights (list of mi.Float, one per level).
+        """
+        saved = (self.illumination, self.diffuse_illumination, self.specular_illumination)
+
+        weights = []
+        for i in range(len(self.mean)):
+            self.illumination          = mi.Color3f(0.0)
+            self.diffuse_illumination  = mi.Color3f(0.0)
+            self.specular_illumination = mi.Color3f(0.0)
+
+            self._convolve_single(i, si, view_dir)
+
+            lum = dr.maximum(
+                0.2126 * self.illumination.x
+                + 0.7152 * self.illumination.y
+                + 0.0722 * self.illumination.z,
+                mi.Float(0.0)
+            )
+            weights.append(lum)
+
+        self.illumination, self.diffuse_illumination, self.specular_illumination = saved
+
+        total = dr.maximum(sum(weights), mi.Float(1e-6))
+        self.vapl_weights = [w / total for w in weights]
+
+    def compute_light_lobes(self, si):
+        """Compute the IS sampling lobe for every VAPL level.
+
+        Uses the light_lobe_axis from sg_product — the axis of the combined
+        VAPL×geometry lobe.  This is the most principled IS direction: it blends
+        the trained vMF axis with the geometric direction toward the VAPL mean,
+        weighted by their sharpnesses, giving the direction the VAPL actually
+        contributes light from at this surface point.
+
+        Stores results in self.light_lobe_axes and self.light_lobe_sharpnesses.
+        """
+        SGLIGHT_SHARPNESS_MAX = float.fromhex("0x1.0p41")
+        eps = 1e-4
+
+        self.light_lobe_axes = []
+        self.light_lobe_sharpnesses = []
+
+        for i in range(len(self.mean)):
+            light_vec        = self.mean[i] - si.p
+            squared_distance = dr.dot(light_vec, light_vec)
+            light_dir        = light_vec * dr.rsqrt(dr.maximum(squared_distance, eps))
+
+            variance        = dr.maximum(self.variance[i], squared_distance / SGLIGHT_SHARPNESS_MAX)
+            light_sharpness = squared_distance / dr.maximum(variance, eps)
+
+            lobe_axis, lobe_sharpness, _ = sg_product(
+                self.axis[i], self.sharpness[i], light_dir, light_sharpness
+            )
+
+            self.light_lobe_axes.append(lobe_axis)
+            self.light_lobe_sharpnesses.append(lobe_sharpness)
+
+    def sample_from_light_lobes(self, sampler):
+        """Sample a direction from the mixture of all level light lobes.
+
+        Levels are weighted by the luminance of their amplitude — the same weighting
+        concept as calculate_normalized_vapl_weights() in the PyTorch class, but using
+        amplitude luminance as a cheap proxy instead of the full BSDF convolution.
+
+        Returns (wo: mi.Vector3f, pdf: mi.Float).
+        Call compute_light_lobes() first.
+        """
+        N   = len(self.light_lobe_axes)
+        eps = 1e-6
+
+        # Use full-convolution weights if available (compute_vapl_weights was called),
+        # otherwise fall back to amplitude luminance
+        if self.vapl_weights:
+            norm_w = self.vapl_weights
+        else:
+            weights = [0.2126 * self.amplitude[i].x
+                     + 0.7152 * self.amplitude[i].y
+                     + 0.0722 * self.amplitude[i].z
+                       for i in range(N)]
+            total_w = dr.maximum(sum(weights), eps)
+            norm_w  = [w / total_w for w in weights]
+
+        # CDF thresholds for level selection
+        cum = [norm_w[0]]
+        for i in range(1, N - 1):
+            cum.append(cum[-1] + norm_w[i])
+
+        # Sample a direction from every level (DrJIT evaluates all, selects one)
+        dirs = [
+            sample_vmf_with_samples(
+                self.light_lobe_axes[i], self.light_lobe_sharpnesses[i],
+                sampler.next_2d()
+            )
+            for i in range(N)
+        ]
+
+        # Select level using CDF and a single uniform sample
+        rand_level = sampler.next_1d()
+        wo          = dirs[-1]
+        chosen_axis = self.light_lobe_axes[-1]
+        chosen_sh   = self.light_lobe_sharpnesses[-1]
+        for i in range(N - 2, -1, -1):
+            sel = rand_level < cum[i]
+            wo          = dr.select(sel, dirs[i],                   wo)
+            chosen_axis = dr.select(sel, self.light_lobe_axes[i],   chosen_axis)
+            chosen_sh   = dr.select(sel, self.light_lobe_sharpnesses[i], chosen_sh)
+
+        # PDF of the selected level only — mirrors the PyTorch sample_vapl approach
+        pdf = dr.maximum(vmf_pdf(wo, chosen_axis, chosen_sh), eps)
+
+        return wo, pdf
 
     def convolve(self, si, view_dir):
         """Convolve all VAPLs with BSDF in a single batched evaluation.
@@ -65,9 +188,11 @@ class vapl_mixture_drjit:
 
         bsdf = si.bsdf()
 
-        ctx_diffuse = mi.BSDFContext()
-        ctx_diffuse.type_mask = mi.BSDFFlags.Diffuse
-        diffuse = bsdf.eval(ctx_diffuse, si, wo_local)
+        # VSGL convention: raw diffuse albedo rho, view-INDEPENDENT.
+        # (bsdf.eval(ctx, si, wo) returns f * cos(theta_wo) per Mitsuba's transport
+        # convention — using it here injected a spurious cos(theta_view) that made
+        # the cache view-dependent and self-training divergent)
+        diffuse = bsdf.eval_diffuse_reflectance(si)
 
         wi_x = wi_local.x
         wi_y = wi_local.y
@@ -288,9 +413,8 @@ class vapl_mixture_drjit:
             axis, sharpness, light_dir, light_sharpness)
 
         # --- Diffuse SG lighting ---
-        ctx_diffuse = mi.BSDFContext()
-        ctx_diffuse.type_mask = mi.BSDFFlags.Diffuse
-        diffuse = bsdf.eval(ctx_diffuse, si, wo_local)
+        # VSGL convention: raw diffuse albedo rho, view-INDEPENDENT
+        diffuse = bsdf.eval_diffuse_reflectance(si)
 
         amp = dr.exp(light_lobe_log_amplitude)
         cosine = dr.clamp(dr.dot(light_lobe_axis, normal), -1.0, 1.0)

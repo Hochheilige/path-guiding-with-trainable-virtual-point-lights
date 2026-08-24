@@ -112,9 +112,9 @@ class vapl_mixture:
         self.light_lobe_axis, self.light_lobe_sharpness, self.light_lobe_log_amplitude = sg_product(
             self.axis[index], self.sharpness[index].unsqueeze(1), light_dir, light_sharpness)
 
-        ctx_diffuse = mi.BSDFContext()
-        ctx_diffuse.type_mask = mi.BSDFFlags.Diffuse
-        diffuse: mi.Spectrum = bsdf.eval(ctx_diffuse, si, wo_ts)
+        # VSGL convention: raw diffuse albedo rho, view-INDEPENDENT (restores the
+        # original eval_diffuse_reflectance; bsdf.eval injected a spurious cos(theta_view)).
+        diffuse: mi.Spectrum = bsdf.eval_diffuse_reflectance(si)
 
         # Diffuse SG lighting.
         # [Tokuyoshi et al. 2024 "Hierarchical Light Sampling with Accurate Spherical Gaussian Lighting", Section 4]
